@@ -808,24 +808,32 @@ class TrimmableArraysCache(ArraysCache):
         if self._state_per_t is not None:
             T = self._state_per_t.shape[1]
             n = T - 1 - amount
-            if 0 <= n < T:
-                self.cache[1] = self._state_per_t[:, n]
-                self.cache[0] = mx.contiguous(
-                    self._conv_input[:, n + 1 : n + 1 + self._n_keep, :]
-                )
+            if n < 0:
+                # Can't rewind past the earliest captured timestep: clamp to
+                # the first checkpoint and report the actual trimmed count.
+                n = 0
+                amount = T - 1
+            self.cache[1] = self._state_per_t[:, n]
+            self.cache[0] = mx.contiguous(
+                self._conv_input[:, n + 1 : n + 1 + self._n_keep, :]
+            )
             self._state_per_t = None
             self._conv_input = None
             self._n_keep = None
             return amount
         if self._history:
-            for _ in range(min(amount, len(self._history))):
+            # The earliest entry is the committed checkpoint; it can't be
+            # rewound past, so clamp to the actual trimmable depth.
+            actual = min(amount, len(self._history) - 1)
+            for _ in range(actual):
                 self._history.pop()
             if self._history:
                 self.cache[1], self.cache[0] = self._history[-1]
                 # Keep only the restored checkpoint; positions behind it can
                 # never be rewound to again, so they would only leak memory.
                 self._history = self._history[-1:]
-        return amount
+            return actual
+        return 0
 
 
 class ChunkedKVCache(_BaseCache):

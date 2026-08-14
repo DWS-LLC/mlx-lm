@@ -7,7 +7,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.generate import generate_step
+from mlx_lm.generate import generate_step, speculative_generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -230,10 +230,11 @@ class TestPromptCache(unittest.TestCase):
         cache[1] = mx.zeros((5, 5))
 
         # Capture off: not trimmable, and trimming is a safe no-op (the
-        # constructor must not produce a cache that crashes in trim()).
+        # constructor must not produce a cache that crashes in trim(), and a
+        # cache with no rollback state must not claim it trimmed anything).
         self.assertFalse(cache.is_trimmable())
         self.assertEqual(trim_prompt_cache([cache], 1), 0)
-        self.assertEqual(cache.trim(1), 1)
+        self.assertEqual(cache.trim(1), 0)
 
         cache.capture_states = True
         self.assertTrue(cache.is_trimmable())
@@ -263,6 +264,66 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache.trim(1), 1)
         self.assertTrue(mx.array_equal(cache[1], state_per_t[:, 1]))
         self.assertTrue(mx.array_equal(cache[0], conv_input[:, 2:5]))
+
+    def test_trimmable_arrays_cache_trim_boundary(self):
+        cache = TrimmableArraysCache(size=2)
+        cache.capture_states = True
+
+        n_keep = 3
+        # Batched snapshot with T=3 checkpoints: it can rewind at most 2
+        # tokens (to the state after the first timestep).
+        conv_input = mx.arange(1 * (n_keep + 3) * 8, dtype=mx.float32).reshape(
+            1, n_keep + 3, 8
+        )
+        state_per_t = mx.arange(1 * 3 * 2 * 4 * 4, dtype=mx.float32).reshape(
+            1, 3, 2, 4, 4
+        )
+        cache.store_history(conv_input, state_per_t, n_keep)
+
+        # amount >= T is clamped to the earliest checkpoint and reports the
+        # actual trimmed count, not the requested amount.
+        self.assertEqual(cache.trim(5), 2)
+        self.assertTrue(mx.array_equal(cache[1], state_per_t[:, 0]))
+        self.assertTrue(mx.array_equal(cache[0], conv_input[:, 1 : 1 + n_keep]))
+
+    def test_trimmable_arrays_cache_trim_zero_clears(self):
+        cache = TrimmableArraysCache(size=2)
+        cache.capture_states = True
+
+        n_keep = 3
+        cache.store_history(
+            mx.zeros((1, n_keep + 2, 8)), mx.zeros((1, 2, 2, 4, 4)), n_keep
+        )
+        cache.append_history(mx.zeros((1, 2, 4, 4)), mx.zeros((1, n_keep, 8)))
+
+        # A fully-accepted round (trim(0)) clears both the batch snapshot and
+        # the sequential history, so no stale rollback state is retained.
+        self.assertEqual(cache.trim(0), 0)
+        self.assertEqual(cache._history, [])
+        self.assertIsNone(cache._state_per_t)
+        self.assertIsNone(cache._conv_input)
+
+    def test_speculative_draft_cache_gate(self):
+        # A draft cache that can't roll back must be rejected loudly, not
+        # silently corrupted: the preflight treats TrimmableArraysCache as
+        # statically capable (capture is enabled later) but a plain
+        # ArraysCache as never capable.
+        class TrimmableModel:
+            def make_cache(self):
+                return [TrimmableArraysCache(size=2)]
+
+        class PlainModel:
+            def make_cache(self):
+                return [ArraysCache(size=2)]
+
+        gen = speculative_generate_step(
+            mx.array([[1, 2, 3]]),
+            TrimmableModel(),
+            PlainModel(),
+            num_draft_tokens=2,
+        )
+        with self.assertRaises(ValueError):
+            next(gen)
 
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
