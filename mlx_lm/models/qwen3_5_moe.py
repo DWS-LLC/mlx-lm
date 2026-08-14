@@ -24,7 +24,11 @@ class ModelArgs(BaseModelArgs):
 class Model(Qwen3_5Model):
 
     def sanitize(self, weights):
-        is_raw_checkpoint = any(not k.startswith("language_model.") for k in weights)
+        is_raw_checkpoint = any(
+            not k.startswith("language_model.")
+            and not (k.startswith("vision_tower") or k.startswith("model.visual"))
+            for k in weights
+        )
         new_weights = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
@@ -55,7 +59,9 @@ class Model(Qwen3_5Model):
                 )
 
         # Per-expert MoE layout (Qwen3.5): experts.<i>.{gate,up,down}_proj.weight.
-        # Stack each projection across experts into switch_mlp.<proj>.weight.
+        # Stack each projection across experts into switch_mlp.<proj>.weight,
+        # after validating the expert IDs are complete and consistent.
+        num_experts = self.language_model.args.num_experts
         per_expert = {}
         for key in list(new_weights):
             m = re.fullmatch(
@@ -64,9 +70,27 @@ class Model(Qwen3_5Model):
             if m:
                 prefix, expert, proj = m.group(1), int(m.group(2)), m.group(3)
                 per_expert.setdefault((prefix, proj), {})[expert] = new_weights.pop(key)
+
+        expected_ids = set(range(num_experts))
+        by_prefix = {}
+        for (prefix, proj), experts in per_expert.items():
+            by_prefix.setdefault(prefix, {})[proj] = experts
+        for prefix, projs in by_prefix.items():
+            if set(projs) != {"gate_proj", "up_proj", "down_proj"}:
+                raise ValueError(
+                    f"MoE experts for {prefix} have projections {sorted(projs)}; "
+                    "expected gate_proj, up_proj, down_proj."
+                )
+            for proj, experts in projs.items():
+                if set(experts) != expected_ids:
+                    raise ValueError(
+                        f"MoE experts for {prefix}.{proj} are {sorted(experts)}; "
+                        f"expected {sorted(expected_ids)}."
+                    )
+
         for (prefix, proj), experts in per_expert.items():
             new_weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
-                [experts[i] for i in sorted(experts)], axis=0
+                [experts[i] for i in range(num_experts)], axis=0
             )
 
         return self.language_model.sanitize(

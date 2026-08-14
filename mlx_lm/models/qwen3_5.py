@@ -621,10 +621,14 @@ class Model(nn.Module):
         return self.language_model.make_mtp_cache()
 
     def sanitize(self, weights):
-        # Detect a raw HF checkpoint before rewriting keys: raw checkpoints use
-        # HF-style keys ("model.language_model.*" or top-level "mtp.*"), while a
-        # converted checkpoint already carries the "language_model." prefix.
-        is_raw_checkpoint = any(not k.startswith("language_model.") for k in weights)
+        # Detect a raw HF checkpoint from the retained language keys only:
+        # leftover vision_tower.*/model.visual.* tensors must not flip a
+        # converted checkpoint to "raw" (which would double-shift norms).
+        is_raw_checkpoint = any(
+            not k.startswith("language_model.")
+            and not (k.startswith("vision_tower") or k.startswith("model.visual"))
+            for k in weights
+        )
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):

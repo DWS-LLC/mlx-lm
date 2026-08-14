@@ -230,6 +230,74 @@ class TestMTP(unittest.TestCase):
         )
         self.assertFalse(any("experts." in k for k in sanitized2))
 
+    def test_raw_checkpoint_detection_ignores_vision(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        base = mx.arange(8, dtype=mx.float32)
+        # A converted checkpoint: all language_model.* weights plus leftover
+        # vision tensors. The vision keys must not mark it "raw" and force a
+        # second +1 norm shift.
+        sanitized = model.sanitize(
+            {
+                "language_model.model.layers.0.input_layernorm.weight": base,
+                "language_model.mtp.pre_fc_norm_hidden.weight": base,
+                "language_model.mtp.pre_fc_norm_embedding.weight": base,
+                "language_model.mtp.norm.weight": base,
+                "language_model.mtp.layers.0.input_layernorm.weight": base,
+                "language_model.mtp.layers.0.post_attention_layernorm.weight": base,
+                "vision_tower.encoder.weight": mx.zeros((8, 8)),
+                "model.visual.proj.weight": mx.zeros((8, 8)),
+            }
+        )
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.layers.0.input_layernorm.weight"],
+                base,
+            )
+        )
+
+    def test_moe_expert_ids_must_be_complete(self):
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = _text_config(mtp_num_hidden_layers=1)
+        text_config["num_experts"] = 2
+        text_config["num_experts_per_tok"] = 1
+        text_config["moe_intermediate_size"] = 16
+        text_config["shared_expert_intermediate_size"] = 8
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe", **text_config},
+            }
+        )
+        model = qwen3_5_moe.Model(args)
+
+        # Experts 0 and 2 (gap at 1) must be rejected, not silently reindexed.
+        with self.assertRaises(ValueError):
+            model.sanitize(
+                {
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((8, 16)),
+                    "mtp.layers.0.mlp.experts.2.gate_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.2.up_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.2.down_proj.weight": mx.zeros((8, 16)),
+                }
+            )
+
+        # A projection missing an expert must also be rejected.
+        with self.assertRaises(ValueError):
+            model.sanitize(
+                {
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((8, 16)),
+                    "mtp.layers.0.mlp.experts.1.gate_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.1.up_proj.weight": mx.zeros((16, 8)),
+                    "mtp.layers.0.mlp.experts.1.down_proj.weight": mx.zeros((8, 16)),
+                    "mtp.layers.0.mlp.experts.2.down_proj.weight": mx.zeros((8, 16)),
+                }
+            )
+
     def test_mtp_generate_step_processor_history(self):
         prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
