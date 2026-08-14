@@ -27,6 +27,7 @@ from .models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
+    TrimmableArraysCache,
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
@@ -517,16 +518,15 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    # Enable per-token state capture so recurrent (DeltaNet) caches can roll
-    # back in O(1) during speculative decoding.
-    for c in model_cache + draft_cache:
-        if isinstance(c, ArraysCache):
-            c.capture_states = True
-
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+        )
+    if not cache.can_trim_prompt_cache(draft_cache):
+        types = {type(c).__name__ for c in draft_cache if not c.is_trimmable()}
+        raise ValueError(
+            f"Speculative decoding requires a trimmable draft cache " f"(got {types})."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -601,6 +601,13 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
+    # Enable per-token recurrent-state capture now that prefill is done. The
+    # decode loop (draft + verify) needs it to roll the recurrent state back
+    # in O(1), while prefill would only materialize a per-token state tensor
+    # it never uses.
+    for c in model_cache + draft_cache:
+        if isinstance(c, TrimmableArraysCache):
+            c.capture_states = True
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0

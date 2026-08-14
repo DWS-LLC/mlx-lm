@@ -234,6 +234,7 @@ def gated_delta_ops(
     beta: mx.array,
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
+    return_per_tok: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -248,6 +249,7 @@ def gated_delta_ops(
     Returns:
       - y: [B, T, Hv, Dv]
       - state: [B, Hv, Dv, Dk]
+      - state_per_t: [B, T, Hv, Dv, Dk] (only when ``return_per_tok``)
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -259,6 +261,7 @@ def gated_delta_ops(
         k = mx.repeat(k, repeat_factor, -2)
 
     ys = []
+    states = [] if return_per_tok else None
     for t in range(T):
         y, state = _gated_delta_step_ops(
             q[:, t],
@@ -270,7 +273,11 @@ def gated_delta_ops(
             None if mask is None else mask[:, t],
         )
         ys.append(y)
+        if return_per_tok:
+            states.append(state)
     y = mx.stack(ys, axis=1)
+    if return_per_tok:
+        return y, state, mx.stack(states, axis=1)
     return y, state
 
 
@@ -307,6 +314,8 @@ def gated_delta_update_per_t(
     A_log: mx.array,
     dt_bias: mx.array,
     state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    use_kernel: bool = True,
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """Like :func:`gated_delta_update` but also returns the recurrent state after
     every timestep, ``state_per_t`` of shape ``[B, T, Hv, Dv, Dk]``, enabling O(1)
@@ -317,6 +326,8 @@ def gated_delta_update_per_t(
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return gated_delta_ops(q, k, v, g, beta, state, mask, return_per_tok=True)
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     return _gated_delta_kernel_per_t(

@@ -13,7 +13,7 @@ from .base import (
     create_attention_mask,
     create_ssm_mask,
 )
-from .cache import ArraysCache, KVCache
+from .cache import KVCache, TrimmableArraysCache
 from .gated_delta import gated_delta_update, gated_delta_update_per_t
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -184,7 +184,16 @@ class GatedDeltaNet(nn.Module):
         capture = getattr(cache, "capture_states", False)
         if capture and S > 1 and mask is None:
             out, state, state_per_t = gated_delta_update_per_t(
-                q, k, v, a, b, self.A_log, self.dt_bias, state
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask=None,
+                use_kernel=not self.training,
             )
         else:
             out, state = gated_delta_update(
@@ -203,7 +212,9 @@ class GatedDeltaNet(nn.Module):
         if cache is not None:
             cache[1] = state
             if capture and S > 1 and mask is None:
-                cache.store_history(mx.contiguous(conv_input), state_per_t)
+                cache.store_history(
+                    mx.contiguous(conv_input), state_per_t, self.conv_kernel_size - 1
+                )
             elif capture:
                 cache.append_history(state, cache[0])
             cache.advance(S)
@@ -353,7 +364,10 @@ class TextModel(nn.Module):
         return self.model.pipeline_layers
 
     def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+        return [
+            TrimmableArraysCache(size=2) if l.is_linear else KVCache()
+            for l in self.layers
+        ]
 
     def sanitize(self, weights):
         has_mtp_weights = any("mtp." in k for k in weights)

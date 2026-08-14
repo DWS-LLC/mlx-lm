@@ -600,8 +600,6 @@ class ArraysCache(_BaseCache):
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        self.capture_states = False
-        self._history = []
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
@@ -725,29 +723,61 @@ class ArraysCache(_BaseCache):
     def empty(self):
         return self.cache[0] is None
 
-    def is_trimmable(self):
-        # Only trimmable when capture_states is set (speculative decoding),
-        # so a plain ArraysCache keeps the historical non-trimmable behavior.
-        return self.capture_states
+    @property
+    def nbytes(self):
+        return sum(c.nbytes for c in self.cache if c is not None)
 
-    def store_history(self, conv_input, state_per_t):
+
+class TrimmableArraysCache(ArraysCache):
+    """An :class:`ArraysCache` that can rewind its recurrent state in O(1).
+
+    Used by recurrent layers (currently Qwen3.5/3.6/3.8's ``GatedDeltaNet``)
+    that record the state after every timestep so speculative decoding can
+    roll back without replaying tokens. The owning layer sets
+    ``capture_states`` during the decode loop to enable the capture; the
+    cache is intrinsically trimmable because the layer is known to support
+    it.
+    """
+
+    def __init__(self, size, left_padding: Optional[List[int]] = None):
+        super().__init__(size, left_padding)
+        self.capture_states = False
+        self._history = []
+
+    def is_trimmable(self):
+        return True
+
+    def store_history(self, conv_input, state_per_t, n_keep):
         """Store per-token states from a batched forward for O(1) rollback."""
         self._conv_input = conv_input
         self._state_per_t = state_per_t
+        self._n_keep = n_keep
 
     def append_history(self, delta_state, conv_state):
-        """Append the state after a single-token forward (sequential rollback)."""
+        """Append the state after a single-token forward (sequential rollback).
+
+        Clears any batched snapshot: once sequential decoding has begun, the
+        batch snapshot (from a prefill chunk) is stale and rollback must use
+        the sequential history.
+        """
+        self._state_per_t = None
+        self._conv_input = None
         self._history.append((delta_state, conv_state))
 
     def trim(self, amount):
         if amount <= 0:
+            # Fully accepted: the current cache state is the new checkpoint and
+            # all earlier history is dead.
+            self._history = []
             return amount
-        if getattr(self, "_state_per_t", None) is not None:
+        if self._state_per_t is not None:
             T = self._state_per_t.shape[1]
             n = T - 1 - amount
             if 0 <= n < T:
                 self.cache[1] = self._state_per_t[:, n]
-                self.cache[0] = mx.contiguous(self._conv_input[:, n + 1 : n + 4, :])
+                self.cache[0] = mx.contiguous(
+                    self._conv_input[:, n + 1 : n + 1 + self._n_keep, :]
+                )
             self._state_per_t = None
             self._conv_input = None
             return amount
@@ -756,11 +786,10 @@ class ArraysCache(_BaseCache):
                 self._history.pop()
             if self._history:
                 self.cache[1], self.cache[0] = self._history[-1]
+                # Keep only the restored checkpoint; positions behind it can
+                # never be rewound to again, so they would only leak memory.
+                self._history = self._history[-1:]
         return amount
-
-    @property
-    def nbytes(self):
-        return sum(c.nbytes for c in self.cache if c is not None)
 
 
 class ChunkedKVCache(_BaseCache):
