@@ -736,6 +736,11 @@ def mtp_generate_step(
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return mx.argmax(logprobs, axis=-1), logprobs
 
+    def _append_token(tokens, tok):
+        if tokens is None:
+            return None
+        return mx.concatenate([tokens, mx.array([tok], mx.uint32)])
+
     def _enable_capture(on):
         for c in model_cache:
             if isinstance(c, TrimmableArraysCache):
@@ -770,9 +775,9 @@ def mtp_generate_step(
     shifted = mx.concatenate([prompt[1:], mx.array([tok0], mx.uint32)], axis=0)
     l_prefill, h = model.mtp_forward(full_hidden, shifted[None], mtp_cache)
     mx.eval([c.state for c in mtp_cache])
-    d1 = _process_and_sample(prev_tokens, l_prefill[0, -1])[0].item()
+    seed_tokens = _append_token(prev_tokens, tok0)
+    d1 = _process_and_sample(seed_tokens, l_prefill[0, -1])[0].item()
     h = h[:, -1:]
-
     ntoks = 0
     num_draft = 0
     n_accept = 0
@@ -794,12 +799,14 @@ def mtp_generate_step(
                 draft.append(d1)
             tok_cur = d1
             h_cur = h
+            draft_tokens = seed_tokens
             for _ in range(max(0, num_draft - 1)):
                 l_mtp, h_cur = model.mtp_forward(
                     h_cur, mx.array([[tok_cur]], mx.uint32), mtp_cache
                 )
                 mx.eval(l_mtp)
-                tok_cur = _process_and_sample(prev_tokens, l_mtp[0, -1])[0].item()
+                draft_tokens = _append_token(draft_tokens, tok_cur)
+                tok_cur = _process_and_sample(draft_tokens, l_mtp[0, -1])[0].item()
                 draft.append(tok_cur)
 
             # Batched verify with capture enabled for O(1) backbone rollback.
@@ -811,10 +818,13 @@ def mtp_generate_step(
             mx.eval(v_logits, v_hidden)
             v_toks = []
             v_lps = []
+            verify_tokens = seed_tokens
             for i in range(num_draft + 1):
-                vt, vlp = _process_and_sample(prev_tokens, v_logits[0, i])
+                vt, vlp = _process_and_sample(verify_tokens, v_logits[0, i])
                 v_toks.append(vt.item())
                 v_lps.append(vlp)
+                if i < num_draft:
+                    verify_tokens = _append_token(verify_tokens, draft[i + 1])
 
             n_accept = 0
             while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
@@ -822,15 +832,11 @@ def mtp_generate_step(
 
             yield tok0, logprobs0, False
             ntoks += 1
-            if prev_tokens is not None:
-                prev_tokens = mx.concatenate([prev_tokens, mx.array([tok0], mx.uint32)])
+            prev_tokens = _append_token(prev_tokens, tok0)
             for i in range(n_accept):
                 yield draft[i + 1], v_lps[i], True
                 ntoks += 1
-                if prev_tokens is not None:
-                    prev_tokens = mx.concatenate(
-                        [prev_tokens, mx.array([draft[i + 1]], mx.uint32)]
-                    )
+                prev_tokens = _append_token(prev_tokens, draft[i + 1])
                 if not unbounded and ntoks >= max_tokens:
                     break
 
@@ -839,6 +845,8 @@ def mtp_generate_step(
 
             tok0 = v_toks[n_accept]
             logprobs0 = v_lps[n_accept]
+            # The next cycle's seed history includes the just-confirmed token.
+            seed_tokens = _append_token(prev_tokens, tok0)
 
             # Rewind the backbone to the confirmed prefix and stop capturing.
             cache.trim_prompt_cache(model_cache, num_draft - n_accept)
@@ -856,7 +864,7 @@ def mtp_generate_step(
                 confirm_hidden, mx.array([confirm_tokens], mx.uint32), mtp_cache
             )
             mx.eval(l_next, h)
-            d1 = _process_and_sample(prev_tokens, l_next[0, -1])[0].item()
+            d1 = _process_and_sample(seed_tokens, l_next[0, -1])[0].item()
             h = h[:, -1:]
     finally:
         cache.trim_prompt_cache(model_cache, num_draft - n_accept)

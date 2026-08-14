@@ -204,6 +204,41 @@ class TestMTP(unittest.TestCase):
         )
         self.assertFalse(any("experts." in k for k in sanitized))
 
+    def test_mtp_generate_step_processor_history(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            seen = []
+
+            def recorder(tokens, logits):
+                # Repetition penalties call len(tokens); logit bias indexes
+                # logits[:, indices]. Both require a real token history and a
+                # batched [1, vocab] tensor at every position.
+                self.assertIsNotNone(tokens)
+                self.assertEqual(logits.ndim, 2)
+                seen.append(len(tokens))
+                return logits
+
+            prompt = mx.array([1, 2, 3])
+            list(
+                mtp_generate_step(
+                    prompt, model, max_tokens=8, logits_processors=[recorder]
+                )
+            )
+
+            # Every processor call got a non-empty history, and the history
+            # grows as tokens are generated (never a constant prompt-only stub).
+            self.assertTrue(seen)
+            self.assertTrue(all(n >= len(prompt) for n in seen))
+            self.assertGreater(max(seen), len(prompt))
+        finally:
+            mx.set_default_device(prev_device)
+
 
 if __name__ == "__main__":
     unittest.main()
