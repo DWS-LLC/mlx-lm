@@ -459,6 +459,24 @@ class TestMTP(unittest.TestCase):
                 mtp_generate_step(mx.array([1, 2, 3]), model, prompt_cache=prompt_cache)
             )
 
+    def test_mtp_rejects_populated_prompt_cache(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt_cache = make_prompt_cache(model)
+            model(mx.array([[1, 2, 3]]), cache=prompt_cache)
+            mx.eval([entry.state for entry in prompt_cache])
+
+            with self.assertRaisesRegex(ValueError, "populated prompt_cache"):
+                list(mtp_generate_step(mx.array([4]), model, prompt_cache=prompt_cache))
+        finally:
+            mx.set_default_device(prev_device)
+
     def test_mtp_final_token_commits_to_prompt_cache(self):
         prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
@@ -500,18 +518,13 @@ class TestMTP(unittest.TestCase):
                 if isinstance(entry, KVCache):
                     self.assertEqual(entry.offset, len(prompt) + 1)
 
-            # Continuation from the committed cache must reproduce the greedy
-            # tail: feeding the next reference token yields the one after it.
-            got2 = [
-                tok
-                for tok, _lp, _fd in mtp_generate_step(
-                    mx.array([ref[1]]),
-                    model,
-                    prompt_cache=prompt_cache,
-                    max_tokens=1,
-                )
-            ]
-            self.assertEqual(got2, ref[2:3])
+            # MTP rejects the populated cache because it cannot reconstruct its
+            # corresponding head state. A direct backbone forward still proves
+            # the emitted token was committed: the next reference token must
+            # predict the one after it from the reused cache.
+            logits = model(mx.array([[ref[1]]]), cache=prompt_cache)
+            mx.eval(logits)
+            self.assertEqual(mx.argmax(logits[0, -1], axis=-1).item(), ref[2])
         finally:
             mx.set_default_device(prev_device)
 

@@ -728,6 +728,15 @@ def mtp_generate_step(
     model_cache = (
         prompt_cache if prompt_cache is not None else cache.make_prompt_cache(model)
     )
+    # MTP has an independent attention cache that is built from the supplied
+    # prompt. A populated backbone-only prompt cache lacks the corresponding
+    # MTP prefix state, so using it would preserve output correctness but
+    # silently degrade the speculative fast path.
+    if prompt_cache is not None and any(not c.empty() for c in model_cache):
+        raise ValueError(
+            "MTP decoding does not support populated prompt_cache entries; "
+            "pass the full prompt without a stored prefix."
+        )
     mtp_cache = model.make_mtp_cache()
 
     def _supports_rollback(c):
