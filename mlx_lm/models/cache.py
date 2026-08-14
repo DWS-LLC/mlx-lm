@@ -734,15 +734,17 @@ class TrimmableArraysCache(ArraysCache):
     Used by recurrent layers (currently Qwen3.5/3.6/3.8's ``GatedDeltaNet``)
     that record the state after every timestep so speculative decoding can
     roll back without replaying tokens. The owning layer sets
-    ``capture_states`` during the decode loop to enable the capture; the
-    cache is intrinsically trimmable because the layer is known to support
-    it.
+    ``capture_states`` during the decode loop to enable the capture.
+
+    The cache only reports itself trimmable while capture is active: outside
+    speculative decoding there is no retained rollback state, so ordinary
+    generation and prompt-cache reuse must not claim a trimmability the cache
+    cannot honor.
     """
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         super().__init__(size, left_padding)
-        self.capture_states = False
-        self._history = []
+        self._init_rollback_state()
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -751,15 +753,18 @@ class TrimmableArraysCache(ArraysCache):
         # initialized here or a loaded cache will crash on the first
         # ``append_history``/``trim``.
         obj = super().from_state(state, meta_state)
-        obj.capture_states = False
-        obj._history = []
-        obj._state_per_t = None
-        obj._conv_input = None
-        obj._n_keep = None
+        obj._init_rollback_state()
         return obj
 
+    def _init_rollback_state(self):
+        self.capture_states = False
+        self._history = []
+        self._state_per_t = None
+        self._conv_input = None
+        self._n_keep = None
+
     def is_trimmable(self):
-        return True
+        return self.capture_states
 
     def store_history(self, conv_input, state_per_t, n_keep):
         """Store per-token states from a batched forward for O(1) rollback."""
@@ -770,19 +775,35 @@ class TrimmableArraysCache(ArraysCache):
     def append_history(self, delta_state, conv_state):
         """Append the state after a single-token forward (sequential rollback).
 
-        Clears any batched snapshot: once sequential decoding has begun, the
-        batch snapshot (from a prefill chunk) is stale and rollback must use
-        the sequential history.
+        A pending batched snapshot is first flushed into the sequential
+        history as per-token entries, so a mixed batched→sequential draft
+        round (a multi-token ``draft_y`` followed by single-token steps) keeps
+        its checkpoints instead of discarding them.
         """
-        self._state_per_t = None
-        self._conv_input = None
+        if self._state_per_t is not None:
+            T = self._state_per_t.shape[1]
+            for i in range(T):
+                self._history.append(
+                    (
+                        self._state_per_t[:, i],
+                        mx.contiguous(
+                            self._conv_input[:, i + 1 : i + 1 + self._n_keep, :]
+                        ),
+                    )
+                )
+            self._state_per_t = None
+            self._conv_input = None
+            self._n_keep = None
         self._history.append((delta_state, conv_state))
 
     def trim(self, amount):
         if amount <= 0:
             # Fully accepted: the current cache state is the new checkpoint and
-            # all earlier history is dead.
+            # all earlier rollback state is dead.
             self._history = []
+            self._state_per_t = None
+            self._conv_input = None
+            self._n_keep = None
             return amount
         if self._state_per_t is not None:
             T = self._state_per_t.shape[1]
@@ -794,6 +815,7 @@ class TrimmableArraysCache(ArraysCache):
                 )
             self._state_per_t = None
             self._conv_input = None
+            self._n_keep = None
             return amount
         if self._history:
             for _ in range(min(amount, len(self._history))):

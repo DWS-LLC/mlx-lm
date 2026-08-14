@@ -326,7 +326,14 @@ def gated_delta_update_per_t(
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    # The per-timestep Metal kernel is built without mask support, so masked
+    # calls go through the ops path to keep device-independent semantics.
+    if (
+        mask is not None
+        or not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+    ):
         return gated_delta_ops(q, k, v, g, beta, state, mask, return_per_tok=True)
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]

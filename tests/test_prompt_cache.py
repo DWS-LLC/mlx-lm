@@ -192,11 +192,14 @@ class TestPromptCache(unittest.TestCase):
         loaded = load_prompt_cache(cache_file)
 
         # ``from_state`` skips ``__init__``, so the transient rollback fields
-        # must be initialized for the loaded cache to be usable in speculative
-        # decoding.
-        self.assertTrue(loaded[0].is_trimmable())
+        # must be initialized (and capture off) for the loaded cache to match
+        # a freshly built one.
+        self.assertFalse(loaded[0].is_trimmable())
+        self.assertEqual(trim_prompt_cache(loaded, 2), 0)
 
-        # Batched capture + trim (model-cache verify path).
+        # Enable capture (as speculative decoding does) and exercise both
+        # rollback paths on the loaded cache.
+        loaded[0].capture_states = True
         n_keep = 3
         conv_input = mx.arange(1 * (n_keep + 4) * 8, dtype=mx.float32).reshape(
             1, n_keep + 4, 8
@@ -220,6 +223,46 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(trim_prompt_cache(loaded, 1), 1)
         self.assertTrue(mx.array_equal(loaded[0][1], first_state))
         self.assertTrue(mx.array_equal(loaded[0][0], first_conv))
+
+    def test_trimmable_arrays_cache_fresh_trim(self):
+        cache = TrimmableArraysCache(size=2)
+        cache[0] = mx.zeros((5, 5))
+        cache[1] = mx.zeros((5, 5))
+
+        # Capture off: not trimmable, and trimming is a safe no-op (the
+        # constructor must not produce a cache that crashes in trim()).
+        self.assertFalse(cache.is_trimmable())
+        self.assertEqual(trim_prompt_cache([cache], 1), 0)
+        self.assertEqual(cache.trim(1), 1)
+
+        cache.capture_states = True
+        self.assertTrue(cache.is_trimmable())
+
+    def test_trimmable_arrays_cache_mixed_rollback(self):
+        cache = TrimmableArraysCache(size=2)
+        cache.capture_states = True
+        cache[0] = mx.zeros((1, 3, 8))
+        cache[1] = mx.zeros((1, 2, 4, 4))
+
+        n_keep = 3
+        # Batched step (S=2): store_history writes T=2 checkpoints.
+        conv_input = mx.arange(1 * (n_keep + 2) * 8, dtype=mx.float32).reshape(
+            1, n_keep + 2, 8
+        )
+        state_per_t = mx.arange(1 * 2 * 2 * 4 * 4, dtype=mx.float32).reshape(
+            1, 2, 2, 4, 4
+        )
+        cache.store_history(conv_input, state_per_t, n_keep)
+
+        # Sequential step (S=1): append_history must flush the batched snapshot
+        # into _history, not discard it.
+        cache.append_history(mx.full((1, 2, 4, 4), 99.0), mx.full((1, n_keep, 8), 99.0))
+
+        # Rewind by one token: restore the checkpoint after the 2-token
+        # batched step, not the just-appended sequential state.
+        self.assertEqual(cache.trim(1), 1)
+        self.assertTrue(mx.array_equal(cache[1], state_per_t[:, 1]))
+        self.assertTrue(mx.array_equal(cache[0], conv_input[:, 2:5]))
 
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer

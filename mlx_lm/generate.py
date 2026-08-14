@@ -518,13 +518,19 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    # A TrimmableArraysCache only reports trimmable once capture is enabled
+    # (after prefill), so the preflight checks static rollback capability
+    # instead of runtime readiness.
+    def _supports_rollback(c):
+        return c.is_trimmable() or isinstance(c, TrimmableArraysCache)
+
+    if not all(_supports_rollback(c) for c in model_cache):
+        types = {type(c).__name__ for c in model_cache if not _supports_rollback(c)}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
-    if not cache.can_trim_prompt_cache(draft_cache):
-        types = {type(c).__name__ for c in draft_cache if not c.is_trimmable()}
+    if not all(_supports_rollback(c) for c in draft_cache):
+        types = {type(c).__name__ for c in draft_cache if not _supports_rollback(c)}
         raise ValueError(
             f"Speculative decoding requires a trimmable draft cache " f"(got {types})."
         )
@@ -656,6 +662,12 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
     finally:
         _rewind_cache(num_draft, n)
+        # Leave caller-owned caches ready for reuse: capture off, so a later
+        # prefill (or prompt-cache reuse) doesn't materialize or consume stale
+        # rollback state.
+        for c in model_cache + draft_cache:
+            if isinstance(c, TrimmableArraysCache):
+                c.capture_states = False
 
 
 def stream_generate(
