@@ -211,6 +211,12 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use the model's native Multi-Token Prediction head for greedy "
+        "speculative decoding (requires a model with an MTP head, e.g. Qwen3.5).",
+    )
     return parser
 
 
@@ -670,12 +676,155 @@ def speculative_generate_step(
                 c.capture_states = False
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 3,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Greedy speculative decoding with the model's native MTP head.
+
+    Each cycle drafts ``num_draft_tokens`` tokens with the MTP head, verifies
+    them in a single backbone forward pass, and emits the confirmed prefix.
+    Only greedy (argmax) decoding is supported: exact token-match acceptance
+    preserves the target distribution only at temperature 0.
+
+    The model must implement ``mtp_forward(hidden, next_tok, mtp_cache)`` and
+    accept ``return_hidden=True``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
+        ``from_draft`` is True when the token was proposed by the MTP head.
+    """
+    if not model.make_mtp_cache():
+        raise ValueError("Model has no MTP head; mtp_generate_step requires one.")
+    if sampler is not None:
+        raise ValueError(
+            "MTP speculative decoding is greedy-only: exact token-match "
+            "acceptance preserves the target distribution only at temperature 0. "
+            "Pass sampler=None."
+        )
+
+    y = prompt.astype(mx.uint32)
+    model_cache = (
+        prompt_cache if prompt_cache is not None else cache.make_prompt_cache(model)
+    )
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _process_and_sample(logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(None, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return mx.argmax(logprobs, axis=-1), logprobs
+
+    def _enable_capture(on):
+        for c in model_cache:
+            if isinstance(c, TrimmableArraysCache):
+                c.capture_states = on
+
+    # Prefill, leaving exactly one token for the bootstrap forward.
+    while y.size > 1:
+        n = min(prefill_step_size, y.size - 1)
+        model(y[:n][None], cache=model_cache)
+        quantize_cache_fn(model_cache)
+        mx.eval([c.state for c in model_cache])
+        y = y[n:]
+        mx.clear_cache()
+
+    # Bootstrap: forward over the last prompt token -> tok0 + its hidden.
+    logits, hidden = model(y[None], cache=model_cache, return_hidden=True)
+    quantize_cache_fn(model_cache)
+    mx.eval(logits, hidden)
+    tok0, logprobs0 = _process_and_sample(logits[0, -1])
+    tok0 = tok0.item()
+    h = hidden[:, -1:]
+
+    ntoks = 0
+    num_draft = 0
+    n_accept = 0
+    try:
+        while ntoks < max_tokens:
+            num_draft = min(max_tokens - ntoks - 1, num_draft_tokens)
+
+            # Draft num_draft tokens with the MTP head, tracking the fused
+            # hidden so each step conditions on the previous one.
+            draft = [tok0]
+            tok_cur = tok0
+            h_cur = h
+            mtp_cache = model.make_mtp_cache()
+            for _ in range(num_draft):
+                l_mtp, h_cur = model.mtp_forward(
+                    h_cur, mx.array([[tok_cur]], mx.uint32), mtp_cache
+                )
+                mx.eval(l_mtp)
+                tok_cur = _process_and_sample(l_mtp[0, -1])[0].item()
+                draft.append(tok_cur)
+
+            # Batched verify with capture enabled for O(1) rollback.
+            _enable_capture(True)
+            v_logits, v_hidden = model(
+                mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
+            )
+            quantize_cache_fn(model_cache)
+            mx.eval(v_logits, v_hidden)
+            v_toks = []
+            v_lps = []
+            for i in range(num_draft + 1):
+                vt, vlp = _process_and_sample(v_logits[0, i])
+                v_toks.append(vt.item())
+                v_lps.append(vlp)
+
+            # Accept: tok0 is confirmed; draft[1..] vs v_toks[0..].
+            n_accept = 0
+            while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
+                n_accept += 1
+
+            yield tok0, logprobs0, False
+            ntoks += 1
+            for i in range(n_accept):
+                yield draft[i + 1], v_lps[i], True
+                ntoks += 1
+                if ntoks >= max_tokens:
+                    break
+
+            if ntoks >= max_tokens:
+                break
+
+            # Next cycle's token + hidden come from the verify position.
+            tok0 = v_toks[n_accept]
+            logprobs0 = v_lps[n_accept]
+            h = v_hidden[:, n_accept : n_accept + 1]
+
+            # Rewind the trunk to the confirmed prefix and stop capturing.
+            cache.trim_prompt_cache(model_cache, num_draft - n_accept)
+            _enable_capture(False)
+    finally:
+        cache.trim_prompt_cache(model_cache, num_draft - n_accept)
+        _enable_capture(False)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -713,8 +862,13 @@ def stream_generate(
     detokenizer = tokenizer.detokenizer
 
     kwargs["max_tokens"] = max_tokens
-
-    if draft_model is None:
+    if mtp and draft_model is not None:
+        raise ValueError("--mtp and --draft-model are mutually exclusive.")
+    if mtp:
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = mtp_generate_step(prompt, model, **kwargs)
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
@@ -2182,15 +2336,31 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(
-        args.temp,
-        args.top_p,
-        args.min_p,
-        args.min_tokens_to_keep,
-        top_k=args.top_k,
-        xtc_probability=args.xtc_probability,
-        xtc_threshold=args.xtc_threshold,
-        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+    if args.mtp and args.draft_model is not None:
+        raise ValueError("--mtp and --draft-model are mutually exclusive.")
+    if args.mtp and (
+        args.temp != DEFAULT_TEMP
+        or args.top_p != DEFAULT_TOP_P
+        or args.top_k != DEFAULT_TOP_K
+        or args.min_p != DEFAULT_MIN_P
+        or args.xtc_probability != DEFAULT_XTC_PROBABILITY
+    ):
+        raise ValueError(
+            "--mtp only supports greedy decoding (temp=0, no top_p/top_k/xtc)."
+        )
+    sampler = (
+        None
+        if args.mtp
+        else make_sampler(
+            args.temp,
+            args.top_p,
+            args.min_p,
+            args.min_tokens_to_keep,
+            top_k=args.top_k,
+            xtc_probability=args.xtc_probability,
+            xtc_threshold=args.xtc_threshold,
+            xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        )
     )
     response = generate(
         model,
@@ -2206,6 +2376,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        mtp=args.mtp,
     )
     if not args.verbose:
         print(response)

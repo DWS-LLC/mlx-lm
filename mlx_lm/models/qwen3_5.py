@@ -42,6 +42,8 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    # Number of layers in the native Multi-Token Prediction head (0 = none).
+    mtp_num_hidden_layers: int = 0
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -262,6 +264,70 @@ class DecoderLayer(nn.Module):
         return out
 
 
+class MTPDecoderLayer(nn.Module):
+    """A full-attention-only decoder layer for the MTP head (no GatedDeltaNet)."""
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        if args.num_experts > 0:
+            self.mlp = SparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MTPModule(nn.Module):
+    """Native Multi-Token Prediction head (Qwen3.5/3.6/3.8 speculative decoding).
+
+    Predicts token t+2 from the backbone's pre-final-norm hidden state at t and
+    the sampled token t+1, reusing the backbone's shared lm_head. Only built when
+    the checkpoint actually contains ``mtp.*`` weights (see ``TextModel.sanitize``).
+    """
+
+    def __init__(self, args: TextModelArgs):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens: nn.Embedding,
+        cache: Optional[Any] = None,
+    ):
+        embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(embeds)
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = create_attention_mask(fused, cache[0])
+        for layer, c in zip(self.layers, cache):
+            fused = layer(fused, mask, c)
+        # Return (normed, pre-norm): the pre-norm hidden feeds the next
+        # iterative draft step.
+        return self.norm(fused), fused
+
+
 class Qwen3_5TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
@@ -334,7 +400,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
                 : hidden_states.shape[0]
             ]
 
-        return self.norm(hidden_states)
+        return hidden_states
 
 
 class TextModel(nn.Module):
@@ -351,12 +417,16 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
+        normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(normed)
         else:
-            out = self.lm_head(out)
+            out = self.lm_head(normed)
+        if return_hidden:
+            return out, hidden
         return out
 
     @property
@@ -369,13 +439,52 @@ class TextModel(nn.Module):
             for l in self.layers
         ]
 
-    def sanitize(self, weights):
+    def make_mtp_cache(self):
+        """Return a fresh list of KVCache entries for the MTP layer(s)."""
+        if hasattr(self, "mtp"):
+            return [KVCache() for _ in self.mtp.layers]
+        return []
+
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        """Run the MTP head and apply the shared lm_head.
+
+        Args:
+            hidden_states: backbone pre-final-norm hidden state (B, N, H).
+            next_token_ids: next token ids, shape (B, N).
+            mtp_cache: KVCache entries for the MTP transformer layer(s).
+
+        Returns:
+            (logits, fused) where logits is (B, N, vocab_size) and fused is
+            the MTP layer's pre-norm hidden (B, N, H) to feed the next step.
+        """
+        normed, fused = self.mtp(
+            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache
+        )
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(normed), fused
+        return self.lm_head(normed), fused
+
+    def sanitize(self, weights, is_raw_checkpoint=False):
         has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        # Norms need a +1 shift only in raw HF checkpoints (detected before key
+        # rewriting by ``Model.sanitize``). Converted checkpoints, including
+        # MTP-preserving ones, already carry shifted norms and must not shift
+        # again.
+        should_shift_norm_weights = is_raw_checkpoint and (
+            has_mtp_weights or has_unsanitized_conv1d
+        )
+
+        # Build the MTP head only when the checkpoint actually ships its
+        # weights. A config advertising mtp_num_hidden_layers > 0 with no mtp.*
+        # weights still loads as a plain trunk.
+        if has_mtp_weights and self.args.mtp_num_hidden_layers > 0:
+            if not hasattr(self, "mtp"):
+                self.mtp = MTPModule(self.args)
+        else:
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -386,6 +495,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -441,16 +553,30 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            return_hidden=return_hidden,
         )
 
     @property
     def model(self):
         return self.language_model.model
 
+    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
     def sanitize(self, weights):
+        # Detect a raw HF checkpoint before rewriting keys: raw checkpoints use
+        # HF-style keys ("model.language_model.*" or top-level "mtp.*"), while a
+        # converted checkpoint already carries the "language_model." prefix.
+        is_raw_checkpoint = any(not k.startswith("language_model.") for k in weights)
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
@@ -464,7 +590,9 @@ class Model(nn.Module):
             else:
                 key = "language_model." + key
             sanitized[key] = value
-        return self.language_model.sanitize(sanitized)
+        return self.language_model.sanitize(
+            sanitized, is_raw_checkpoint=is_raw_checkpoint
+        )
 
     def shard(self, group=None):
         group = group or mx.distributed.init()

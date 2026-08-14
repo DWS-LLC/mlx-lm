@@ -21,6 +21,7 @@ class ModelArgs(BaseModelArgs):
 class Model(Qwen3_5Model):
 
     def sanitize(self, weights):
+        is_raw_checkpoint = any(not k.startswith("language_model.") for k in weights)
         new_weights = {}
         for key, value in weights.items():
             if key.startswith("vision_tower") or key.startswith("model.visual"):
@@ -49,4 +50,6 @@ class Model(Qwen3_5Model):
                     f"{prefix}.experts.down_proj"
                 )
 
-        return self.language_model.sanitize(new_weights)
+        return self.language_model.sanitize(
+            new_weights, is_raw_checkpoint=is_raw_checkpoint
+        )
