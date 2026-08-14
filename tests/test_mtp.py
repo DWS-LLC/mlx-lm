@@ -355,7 +355,7 @@ class TestMTP(unittest.TestCase):
                 mtp_generate_step(mx.array([1, 2, 3]), model, prompt_cache=prompt_cache)
             )
 
-    def test_mtp_zero_draft_final_cycle_keeps_cache_clean(self):
+    def test_mtp_final_token_commits_to_prompt_cache(self):
         prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
         try:
@@ -364,21 +364,50 @@ class TestMTP(unittest.TestCase):
             model.eval()
             mx.eval(model.parameters())
 
+            prompt = mx.array([1, 2, 3])
+
+            # Full greedy reference over the whole sequence.
+            ref = []
+            y = prompt
+            c = make_prompt_cache(model)
+            while y.size > 1:
+                model(y[:-1][None], cache=c)
+                y = y[-1:]
+            cur = y.item()
+            for _ in range(3):
+                logits = model(mx.array([[cur]]), cache=c)
+                mx.eval(logits)
+                cur = mx.argmax(logits[0, -1], axis=-1).item()
+                ref.append(cur)
+
+            # max_tokens=1 forces the num_draft <= 0 branch on the first cycle.
             prompt_cache = make_prompt_cache(model)
-            list(
-                mtp_generate_step(
-                    mx.array([1, 2, 3]),
+            got1 = [
+                tok
+                for tok, _lp, _fd in mtp_generate_step(
+                    prompt, model, prompt_cache=prompt_cache, max_tokens=1
+                )
+            ]
+            self.assertEqual(got1, ref[:1])
+
+            # The emitted token must be committed to the cache: exact offset,
+            # not merely <= prompt + output.
+            for entry in prompt_cache:
+                if isinstance(entry, KVCache):
+                    self.assertEqual(entry.offset, len(prompt) + 1)
+
+            # Continuation from the committed cache must reproduce the greedy
+            # tail: feeding the next reference token yields the one after it.
+            got2 = [
+                tok
+                for tok, _lp, _fd in mtp_generate_step(
+                    mx.array([ref[1]]),
                     model,
                     prompt_cache=prompt_cache,
-                    max_tokens=3,
+                    max_tokens=1,
                 )
-            )
-            # The finally block must not trim a negative amount when the last
-            # cycle has num_draft == 0; the KV offset stays within the
-            # confirmed prefix (3 prompt + 3 generated tokens).
-            for c in prompt_cache:
-                if isinstance(c, KVCache):
-                    self.assertLessEqual(c.offset, 6)
+            ]
+            self.assertEqual(got2, ref[2:3])
         finally:
             mx.set_default_device(prev_device)
 

@@ -834,6 +834,13 @@ def mtp_generate_step(
             else:
                 num_draft = min(max_tokens - ntoks - 1, num_draft_tokens)
                 if num_draft <= 0:
+                    # Forward the final token through the backbone so a
+                    # caller-owned prompt_cache includes it; saving/reusing
+                    # that cache for continuation would otherwise be one
+                    # token short of the emitted history.
+                    model(mx.array([[tok0]], mx.uint32), cache=model_cache)
+                    quantize_cache_fn(model_cache)
+                    mx.eval([c.state for c in model_cache])
                     n_accept = 0
                     n_yielded = 0
                     yield tok0, logprobs0, False
