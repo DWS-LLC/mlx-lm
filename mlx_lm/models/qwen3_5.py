@@ -487,18 +487,20 @@ class TextModel(nn.Module):
             return self.model.embed_tokens.as_linear(normed), fused
         return self.lm_head(normed), fused
 
-    def sanitize(self, weights, is_raw_checkpoint=False):
+    def sanitize(self, weights, is_raw_backbone=False, is_raw_mtp=False):
         has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
         # Norms need a +1 shift only in raw HF checkpoints (detected before key
-        # rewriting by ``Model.sanitize``). Converted checkpoints, including
-        # MTP-preserving ones, already carry shifted norms and must not shift
-        # again.
-        should_shift_norm_weights = is_raw_checkpoint and (
+        # rewriting by ``Model.sanitize``). Track the backbone and MTP head
+        # provenance separately: a converted backbone combined with raw
+        # standalone mtp.* weights must shift only the MTP norms, never
+        # double-shift the already-shifted backbone norms.
+        should_shift_backbone = is_raw_backbone and (
             has_mtp_weights or has_unsanitized_conv1d
         )
+        should_shift_mtp = is_raw_mtp and has_mtp_weights
 
         # Build the MTP head only when the checkpoint actually ships its
         # weights. A config advertising mtp_num_hidden_layers > 0 with no mtp.*
@@ -537,8 +539,11 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
-                if v.ndim == 1:
+            if v.ndim == 1 and any(k.endswith(sfx) for sfx in norm_keys):
+                if "mtp." in k:
+                    if should_shift_mtp:
+                        weights[k] = v + 1.0
+                elif should_shift_backbone:
                     weights[k] = v + 1.0
         return weights
 
@@ -621,19 +626,18 @@ class Model(nn.Module):
         return self.language_model.make_mtp_cache()
 
     def sanitize(self, weights):
-        # Detect a raw HF checkpoint from the retained language keys only:
-        # leftover vision_tower.*/model.visual.* tensors must not flip a
+        def _is_vision(k):
+            return k.startswith("vision_tower") or k.startswith("model.visual")
+
+        # Track the backbone and MTP provenance separately so a converted
+        # language_model.* backbone combined with raw standalone mtp.* weights
+        # only shifts the MTP norms. Leftover vision tensors must not flip a
         # converted checkpoint to "raw" (which would double-shift norms).
-        is_raw_checkpoint = any(
-            not k.startswith("language_model.")
-            and not (k.startswith("vision_tower") or k.startswith("model.visual"))
-            for k in weights
-        )
+        is_raw_backbone = any(k.startswith("model.language_model.") for k in weights)
+        is_raw_mtp = any(k.startswith("mtp.") for k in weights)
         sanitized = {}
         for key, value in weights.items():
-            if key.startswith("vision_tower") or key.startswith("model.visual"):
-                continue
-            if key.startswith("model.visual"):
+            if _is_vision(key):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
@@ -643,7 +647,7 @@ class Model(nn.Module):
                 key = "language_model." + key
             sanitized[key] = value
         return self.language_model.sanitize(
-            sanitized, is_raw_checkpoint=is_raw_checkpoint
+            sanitized, is_raw_backbone=is_raw_backbone, is_raw_mtp=is_raw_mtp
         )
 
     def shard(self, group=None):

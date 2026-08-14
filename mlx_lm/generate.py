@@ -849,8 +849,10 @@ def mtp_generate_step(
     ntoks = 0
     num_draft = 0
     n_accept = 0
-    n_yielded = 0
-    rewound = True
+    # Verification appends tok0 plus every draft to model_cache. Count the
+    # entries not yet yielded so exceptions and early generator closure can
+    # restore a caller-owned cache to the emitted prefix.
+    pending_trim = 0
     try:
         while unbounded or ntoks < max_tokens:
             if unbounded:
@@ -865,8 +867,6 @@ def mtp_generate_step(
                     model(mx.array([[tok0]], mx.uint32), cache=model_cache)
                     quantize_cache_fn(model_cache)
                     mx.eval([c.state for c in model_cache])
-                    n_accept = 0
-                    n_yielded = 0
                     yield tok0, logprobs0, False
                     ntoks += 1
                     break
@@ -899,6 +899,9 @@ def mtp_generate_step(
             )
             quantize_cache_fn(model_cache)
             mx.eval(v_logits, v_hidden)
+            # The verification forward appended tok0 plus every draft. None is
+            # committed until its corresponding token has been yielded.
+            pending_trim = num_draft + 1
             v_toks = []
             v_lps = []
             verify_tokens = seed_tokens
@@ -912,13 +915,12 @@ def mtp_generate_step(
             n_accept = 0
             while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
                 n_accept += 1
-            n_yielded = 0
-            rewound = False
+            pending_trim -= 1
             yield tok0, logprobs0, False
             ntoks += 1
             prev_tokens = _append_token(prev_tokens, tok0)
             for i in range(n_accept):
-                n_yielded += 1
+                pending_trim -= 1
                 yield draft[i + 1], v_lps[i], True
                 ntoks += 1
                 prev_tokens = _append_token(prev_tokens, draft[i + 1])
@@ -934,8 +936,8 @@ def mtp_generate_step(
             seed_tokens = _append_token(prev_tokens, tok0)
 
             # Rewind the backbone to the confirmed prefix and stop capturing.
-            cache.trim_prompt_cache(model_cache, num_draft - n_yielded)
-            rewound = True
+            cache.trim_prompt_cache(model_cache, pending_trim)
+            pending_trim = 0
             _enable_capture(False)
 
             # Reconcile the MTP cache: drop each layer's draft-appended slots
@@ -958,8 +960,8 @@ def mtp_generate_step(
             d1 = _process_and_sample(seed_tokens, l_next[0, -1])[0].item()
             h = h[:, -1:]
     finally:
-        if not rewound:
-            cache.trim_prompt_cache(model_cache, num_draft - n_yielded)
+        if pending_trim:
+            cache.trim_prompt_cache(model_cache, pending_trim)
         _enable_capture(False)
 
 
@@ -1028,30 +1030,36 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        try:
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
-            yield GenerationResponse(
-                text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
-                from_draft=from_draft,
-                prompt_tokens=prompt.size,
-                prompt_tps=prompt_tps,
-                generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
-                peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
-            )
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+        finally:
+            # mtp_generate_step can be suspended after yielding a verified
+            # token. Closing it runs its rollback before the terminal response
+            # exposes a reusable prompt_cache to the caller.
+            token_generator.close()
 
         detokenizer.finalize()
         yield GenerationResponse(

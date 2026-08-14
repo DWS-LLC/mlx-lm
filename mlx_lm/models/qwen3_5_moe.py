@@ -24,14 +24,17 @@ class ModelArgs(BaseModelArgs):
 class Model(Qwen3_5Model):
 
     def sanitize(self, weights):
-        is_raw_checkpoint = any(
-            not k.startswith("language_model.")
-            and not (k.startswith("vision_tower") or k.startswith("model.visual"))
-            for k in weights
-        )
+        def _is_vision(k):
+            return k.startswith("vision_tower") or k.startswith("model.visual")
+
+        # Backbone and MTP provenance are tracked separately (see the base
+        # Model.sanitize): a converted backbone with raw mtp.* weights must
+        # shift only the MTP norms.
+        is_raw_backbone = any(k.startswith("model.language_model.") for k in weights)
+        is_raw_mtp = any(k.startswith("mtp.") for k in weights)
         new_weights = {}
         for key, value in weights.items():
-            if key.startswith("vision_tower") or key.startswith("model.visual"):
+            if _is_vision(key):
                 continue
             if key.startswith("model.language_model"):
                 key = key.replace("model.language_model", "language_model.model")
@@ -94,5 +97,5 @@ class Model(Qwen3_5Model):
             )
 
         return self.language_model.sanitize(
-            new_weights, is_raw_checkpoint=is_raw_checkpoint
+            new_weights, is_raw_backbone=is_raw_backbone, is_raw_mtp=is_raw_mtp
         )

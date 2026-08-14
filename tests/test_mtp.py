@@ -1,12 +1,15 @@
 # Copyright © 2026 Apple Inc.
 
+import contextlib
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 
-from mlx_lm.generate import mtp_generate_step
+from mlx_lm.generate import mtp_generate_step, stream_generate
 from mlx_lm.models.cache import KVCache, TrimmableArraysCache, make_prompt_cache
 from mlx_lm.models.qwen3_5 import Model, ModelArgs, MTPModule
+from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 
 def _text_config(mtp_num_hidden_layers=1):
@@ -99,6 +102,26 @@ class TestMTP(unittest.TestCase):
         self.assertTrue(
             mx.array_equal(
                 loaded["language_model.mtp.pre_fc_norm_hidden.weight"], base + 1.0
+            )
+        )
+
+    def test_sanitize_mixed_checkpoint_shifts_only_raw_mtp_norms(self):
+        base = mx.arange(8, dtype=mx.float32)
+        converted_backbone_key = "language_model.model.layers.0.input_layernorm.weight"
+        model = _make_model(mtp_num_hidden_layers=1)
+        sanitized = model.sanitize(
+            {
+                # Converted MLX weights are already shifted.
+                converted_backbone_key: base + 1.0,
+                # Standalone MTP weights retain raw HF RMSNorm convention.
+                "mtp.pre_fc_norm_hidden.weight": base,
+            }
+        )
+
+        self.assertTrue(mx.array_equal(sanitized[converted_backbone_key], base + 1.0))
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.mtp.pre_fc_norm_hidden.weight"], base + 1.0
             )
         )
 
@@ -333,6 +356,45 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_processor_exception_restores_prompt_cache(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt = mx.array([1, 2, 3])
+            prompt_cache = make_prompt_cache(model)
+            calls = 0
+
+            def fail_during_verify(_tokens, logits):
+                nonlocal calls
+                calls += 1
+                # bootstrap tok0, MTP seed d1, then the first verify logit
+                if calls == 3:
+                    raise RuntimeError("processor failure")
+                return logits
+
+            with self.assertRaisesRegex(RuntimeError, "processor failure"):
+                list(
+                    mtp_generate_step(
+                        prompt,
+                        model,
+                        prompt_cache=prompt_cache,
+                        max_tokens=3,
+                        num_draft_tokens=1,
+                        logits_processors=[fail_during_verify],
+                    )
+                )
+
+            for entry in prompt_cache:
+                if isinstance(entry, KVCache):
+                    self.assertEqual(entry.offset, len(prompt))
+        finally:
+            mx.set_default_device(prev_device)
+
     def test_mtp_rejects_non_positive_num_draft_tokens(self):
         model = _make_model(mtp_num_hidden_layers=1)
         model.language_model.mtp = MTPModule(model.language_model.args)
@@ -408,6 +470,55 @@ class TestMTP(unittest.TestCase):
                 )
             ]
             self.assertEqual(got2, ref[2:3])
+        finally:
+            mx.set_default_device(prev_device)
+
+    def test_stream_mtp_finalizes_cache_before_terminal_response(self):
+        class FakeTokenizer:
+            eos_token_id = 0
+            chat_template = None
+
+            def get_vocab(self):
+                return {}
+
+            def encode(self, _text, add_special_tokens=False):
+                return [1]
+
+            def decode(self, tokens):
+                return "".join(map(str, tokens))
+
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt = mx.array([1, 2, 3])
+            prompt_cache = make_prompt_cache(model)
+            eos_bias = mx.array([[1e6] + [0.0] * 31])
+
+            with patch(
+                "mlx_lm.generate.wired_limit", return_value=contextlib.nullcontext()
+            ):
+                responses = list(
+                    stream_generate(
+                        model,
+                        TokenizerWrapper(FakeTokenizer()),
+                        prompt,
+                        prompt_cache=prompt_cache,
+                        mtp=True,
+                        max_tokens=4,
+                        logits_processors=[lambda _tokens, logits: logits + eos_bias],
+                    )
+                )
+
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(responses[0].finish_reason, "stop")
+            for entry in prompt_cache:
+                if isinstance(entry, KVCache):
+                    self.assertEqual(entry.offset, len(prompt) + 1)
         finally:
             mx.set_default_device(prev_device)
 
