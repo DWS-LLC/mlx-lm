@@ -721,6 +721,15 @@ def mtp_generate_step(
     )
     mtp_cache = model.make_mtp_cache()
 
+    def _supports_rollback(c):
+        return c.is_trimmable() or isinstance(c, TrimmableArraysCache)
+
+    if not all(_supports_rollback(c) for c in model_cache):
+        types = {type(c).__name__ for c in model_cache if not _supports_rollback(c)}
+        raise ValueError(
+            f"MTP speculative decoding requires a trimmable prompt cache (got {types})."
+        )
+
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
@@ -790,10 +799,10 @@ def mtp_generate_step(
             else:
                 num_draft = min(max_tokens - ntoks - 1, num_draft_tokens)
                 if num_draft <= 0:
+                    n_accept = 0
                     yield tok0, logprobs0, False
                     ntoks += 1
                     break
-
             # Draft num_draft tokens. d1 is already predicted (from the prefill
             # or the previous reconciliation); forward only subsequent tokens.
             draft = [tok0]

@@ -274,6 +274,46 @@ class TestMTP(unittest.TestCase):
                     mtp_generate_step(mx.array([1, 2, 3]), model, num_draft_tokens=bad)
                 )
 
+    def test_mtp_rejects_non_trimmable_prompt_cache(self):
+        from mlx_lm.models.cache import ArraysCache
+
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.language_model.mtp = MTPModule(model.language_model.args)
+        # A plain ArraysCache is not rollback-capable; the MTP preflight must
+        # reject it instead of silently leaving rejected drafts cached.
+        prompt_cache = [ArraysCache(size=2), KVCache()]
+        with self.assertRaises(ValueError):
+            list(
+                mtp_generate_step(mx.array([1, 2, 3]), model, prompt_cache=prompt_cache)
+            )
+
+    def test_mtp_zero_draft_final_cycle_keeps_cache_clean(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt_cache = make_prompt_cache(model)
+            list(
+                mtp_generate_step(
+                    mx.array([1, 2, 3]),
+                    model,
+                    prompt_cache=prompt_cache,
+                    max_tokens=3,
+                )
+            )
+            # The finally block must not trim a negative amount when the last
+            # cycle has num_draft == 0; the KV offset stays within the
+            # confirmed prefix (3 prompt + 3 generated tokens).
+            for c in prompt_cache:
+                if isinstance(c, KVCache):
+                    self.assertLessEqual(c.offset, 6)
+        finally:
+            mx.set_default_device(prev_device)
+
 
 if __name__ == "__main__":
     unittest.main()
