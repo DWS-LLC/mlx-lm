@@ -717,6 +717,7 @@ def mtp_generate_step(
     model_cache = (
         prompt_cache if prompt_cache is not None else cache.make_prompt_cache(model)
     )
+    mtp_cache = model.make_mtp_cache()
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -725,10 +726,13 @@ def mtp_generate_step(
         kv_bits=kv_bits,
     )
 
-    def _process_and_sample(logits):
+    def _process_and_sample(tokens, logits):
         if logits_processors:
+            if logits.ndim == 1:
+                logits = logits[None]
             for processor in logits_processors:
-                logits = processor(None, logits)
+                logits = processor(tokens, logits)
+            logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return mx.argmax(logprobs, axis=-1), logprobs
 
@@ -737,45 +741,68 @@ def mtp_generate_step(
             if isinstance(c, TrimmableArraysCache):
                 c.capture_states = on
 
-    # Prefill, leaving exactly one token for the bootstrap forward.
+    # Prefill the backbone, collecting the pre-norm hidden for the full prompt.
+    hidden_chunks = []
     while y.size > 1:
         n = min(prefill_step_size, y.size - 1)
-        model(y[:n][None], cache=model_cache)
+        _, hid = model(y[:n][None], cache=model_cache, return_hidden=True)
         quantize_cache_fn(model_cache)
+        hidden_chunks.append(hid)
         mx.eval([c.state for c in model_cache])
         y = y[n:]
         mx.clear_cache()
 
+    unbounded = max_tokens < 0
+    prev_tokens = prompt if logits_processors else None
+
     # Bootstrap: forward over the last prompt token -> tok0 + its hidden.
-    logits, hidden = model(y[None], cache=model_cache, return_hidden=True)
+    logits, hid_last = model(y[None], cache=model_cache, return_hidden=True)
     quantize_cache_fn(model_cache)
-    mx.eval(logits, hidden)
-    tok0, logprobs0 = _process_and_sample(logits[0, -1])
+    mx.eval(logits, hid_last)
+    tok0, logprobs0 = _process_and_sample(prev_tokens, logits[0, -1])
     tok0 = tok0.item()
-    h = hidden[:, -1:]
+
+    # Prefill the MTP attention cache with the shifted prompt sequence: the
+    # MTP head predicts token t+2 from (hidden_t, token_{t+1}), so position t
+    # consumes the next token and the backbone hidden at t. The prefill's last
+    # logits are the first draft prediction, so no extra forward is needed.
+    full_hidden = mx.concatenate(hidden_chunks + [hid_last], axis=1)
+    shifted = mx.concatenate([prompt[1:], mx.array([tok0], mx.uint32)], axis=0)
+    l_prefill, h = model.mtp_forward(full_hidden, shifted[None], mtp_cache)
+    mx.eval([c.state for c in mtp_cache])
+    d1 = _process_and_sample(prev_tokens, l_prefill[0, -1])[0].item()
+    h = h[:, -1:]
 
     ntoks = 0
     num_draft = 0
     n_accept = 0
     try:
-        while ntoks < max_tokens:
-            num_draft = min(max_tokens - ntoks - 1, num_draft_tokens)
+        while unbounded or ntoks < max_tokens:
+            if unbounded:
+                num_draft = num_draft_tokens
+            else:
+                num_draft = min(max_tokens - ntoks - 1, num_draft_tokens)
+                if num_draft <= 0:
+                    yield tok0, logprobs0, False
+                    ntoks += 1
+                    break
 
-            # Draft num_draft tokens with the MTP head, tracking the fused
-            # hidden so each step conditions on the previous one.
+            # Draft num_draft tokens. d1 is already predicted (from the prefill
+            # or the previous reconciliation); forward only subsequent tokens.
             draft = [tok0]
-            tok_cur = tok0
+            if num_draft > 0:
+                draft.append(d1)
+            tok_cur = d1
             h_cur = h
-            mtp_cache = model.make_mtp_cache()
-            for _ in range(num_draft):
+            for _ in range(max(0, num_draft - 1)):
                 l_mtp, h_cur = model.mtp_forward(
                     h_cur, mx.array([[tok_cur]], mx.uint32), mtp_cache
                 )
                 mx.eval(l_mtp)
-                tok_cur = _process_and_sample(l_mtp[0, -1])[0].item()
+                tok_cur = _process_and_sample(prev_tokens, l_mtp[0, -1])[0].item()
                 draft.append(tok_cur)
 
-            # Batched verify with capture enabled for O(1) rollback.
+            # Batched verify with capture enabled for O(1) backbone rollback.
             _enable_capture(True)
             v_logits, v_hidden = model(
                 mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
@@ -785,34 +812,52 @@ def mtp_generate_step(
             v_toks = []
             v_lps = []
             for i in range(num_draft + 1):
-                vt, vlp = _process_and_sample(v_logits[0, i])
+                vt, vlp = _process_and_sample(prev_tokens, v_logits[0, i])
                 v_toks.append(vt.item())
                 v_lps.append(vlp)
 
-            # Accept: tok0 is confirmed; draft[1..] vs v_toks[0..].
             n_accept = 0
             while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
                 n_accept += 1
 
             yield tok0, logprobs0, False
             ntoks += 1
+            if prev_tokens is not None:
+                prev_tokens = mx.concatenate([prev_tokens, mx.array([tok0], mx.uint32)])
             for i in range(n_accept):
                 yield draft[i + 1], v_lps[i], True
                 ntoks += 1
-                if ntoks >= max_tokens:
+                if prev_tokens is not None:
+                    prev_tokens = mx.concatenate(
+                        [prev_tokens, mx.array([draft[i + 1]], mx.uint32)]
+                    )
+                if not unbounded and ntoks >= max_tokens:
                     break
 
-            if ntoks >= max_tokens:
+            if not unbounded and ntoks >= max_tokens:
                 break
 
-            # Next cycle's token + hidden come from the verify position.
             tok0 = v_toks[n_accept]
             logprobs0 = v_lps[n_accept]
-            h = v_hidden[:, n_accept : n_accept + 1]
 
-            # Rewind the trunk to the confirmed prefix and stop capturing.
+            # Rewind the backbone to the confirmed prefix and stop capturing.
             cache.trim_prompt_cache(model_cache, num_draft - n_accept)
             _enable_capture(False)
+
+            # Reconcile the MTP cache: drop the draft-appended positions (which
+            # used the MTP head's own approximation of the hidden state) and
+            # re-append the confirmed positions using the backbone's verified
+            # hidden states, so the next draft attends to the correct context.
+            for c in mtp_cache:
+                c.trim(num_draft - 1)
+            confirm_tokens = draft[1 : n_accept + 1] + [v_toks[n_accept]]
+            confirm_hidden = v_hidden[:, : n_accept + 1]
+            l_next, h = model.mtp_forward(
+                confirm_hidden, mx.array([confirm_tokens], mx.uint32), mtp_cache
+            )
+            mx.eval(l_next, h)
+            d1 = _process_and_sample(prev_tokens, l_next[0, -1])[0].item()
+            h = h[:, -1:]
     finally:
         cache.trim_prompt_cache(model_cache, num_draft - n_accept)
         _enable_capture(False)

@@ -154,6 +154,56 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_cache_prefill(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.language_model.mtp = MTPModule(model.language_model.args)
+        model.eval()
+        mx.eval(model.parameters())
+
+        mtp_cache = model.make_mtp_cache()
+        hidden = mx.random.normal((1, 3, 8))
+        tokens = mx.array([[2, 3, 4]])
+        _, _ = model.mtp_forward(hidden, tokens, mtp_cache)
+        mx.eval([c.state for c in mtp_cache])
+
+        # A prefilled MTP cache must hold one KV entry per prompt position.
+        self.assertEqual(mtp_cache[0].offset, 3)
+
+    def test_moe_expert_stacking_for_mtp(self):
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = _text_config(mtp_num_hidden_layers=1)
+        text_config["num_experts"] = 2
+        text_config["num_experts_per_tok"] = 1
+        text_config["moe_intermediate_size"] = 16
+        text_config["shared_expert_intermediate_size"] = 8
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe", **text_config},
+            }
+        )
+        model = qwen3_5_moe.Model(args)
+
+        sanitized = model.sanitize(
+            {
+                "mtp.layers.0.mlp.experts.gate_up_proj": mx.zeros((2, 32, 8)),
+                "mtp.layers.0.mlp.experts.down_proj": mx.zeros((2, 8, 16)),
+            }
+        )
+        # The MTP expert weights must be fused into switch_mlp, not left as
+        # unmatched experts.* tensors.
+        self.assertIn(
+            "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight", sanitized
+        )
+        self.assertIn(
+            "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.weight", sanitized
+        )
+        self.assertIn(
+            "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight", sanitized
+        )
+        self.assertFalse(any("experts." in k for k in sanitized))
+
 
 if __name__ == "__main__":
     unittest.main()
