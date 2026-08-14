@@ -325,6 +325,31 @@ class TestPromptCache(unittest.TestCase):
         with self.assertRaises(ValueError):
             next(gen)
 
+    def test_trimmable_arrays_cache_capture_disable_clears(self):
+        cache = TrimmableArraysCache(size=2)
+        cache.capture_states = True
+        cache.store_history(mx.zeros((1, 5, 8)), mx.zeros((1, 2, 2, 4, 4)), n_keep=3)
+        cache.append_history(mx.zeros((1, 2, 4, 4)), mx.zeros((1, 3, 8)))
+
+        # Disabling capture must drop all transient rollback state, so a reused
+        # cache can't restore a checkpoint left over from a previous session.
+        cache.capture_states = False
+        self.assertFalse(cache.is_trimmable())
+        self.assertEqual(cache._history, [])
+        self.assertIsNone(cache._state_per_t)
+        self.assertIsNone(cache._conv_input)
+
+    def test_trimmable_arrays_cache_extract(self):
+        cache = TrimmableArraysCache(size=2)
+        cache[0] = mx.zeros((4, 3, 8))
+        cache[1] = mx.zeros((4, 2, 4, 4))
+
+        # extract() must preserve the subtype, not downgrade to a plain
+        # ArraysCache that the speculative preflight would reject.
+        extracted = cache.extract(0)
+        self.assertIsInstance(extracted, TrimmableArraysCache)
+        self.assertFalse(extracted.is_trimmable())
+
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]

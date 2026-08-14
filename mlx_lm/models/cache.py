@@ -756,15 +756,32 @@ class TrimmableArraysCache(ArraysCache):
         obj._init_rollback_state()
         return obj
 
+    @property
+    def capture_states(self):
+        return self._capture_states
+
+    @capture_states.setter
+    def capture_states(self, value):
+        self._capture_states = bool(value)
+        if not value:
+            # Disabling capture drops all transient rollback state, so a reused
+            # cache can't restore a checkpoint left over from a previous
+            # generation session.
+            self._history = []
+            self._state_per_t = None
+            self._conv_input = None
+            self._n_keep = None
+
     def _init_rollback_state(self):
         self.capture_states = False
-        self._history = []
-        self._state_per_t = None
-        self._conv_input = None
-        self._n_keep = None
 
     def is_trimmable(self):
         return self.capture_states
+
+    def extract(self, idx):
+        cache = TrimmableArraysCache(len(self.cache))
+        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        return cache
 
     def store_history(self, conv_input, state_per_t, n_keep):
         """Store per-token states from a batched forward for O(1) rollback."""

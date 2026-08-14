@@ -131,6 +131,9 @@ _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
 _gated_delta_kernel_per_t = _make_gated_delta_kernel(
     has_mask=False, vectorized=False, return_per_tok=True
 )
+_gated_delta_kernel_per_t_vec = _make_gated_delta_kernel(
+    has_mask=False, vectorized=True, return_per_tok=True
+)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
@@ -337,7 +340,8 @@ def gated_delta_update_per_t(
         return gated_delta_ops(q, k, v, g, beta, state, mask, return_per_tok=True)
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
-    return _gated_delta_kernel_per_t(
+    kernel = _gated_delta_kernel_per_t_vec if g.ndim == 4 else _gated_delta_kernel_per_t
+    return kernel(
         inputs=[q, k, v, g, beta, state, T],
         template=[
             ("InT", q.dtype),
