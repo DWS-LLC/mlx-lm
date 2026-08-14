@@ -204,6 +204,32 @@ class TestMTP(unittest.TestCase):
         )
         self.assertFalse(any("experts." in k for k in sanitized))
 
+        # Per-expert layout (Qwen3.5): experts.<i>.{gate,up,down}_proj.weight
+        # must be stacked across experts into switch_mlp.<proj>.weight.
+        sanitized2 = model.sanitize(
+            {
+                "mtp.layers.0.mlp.experts.0.gate_proj.weight": mx.zeros((16, 8)),
+                "mtp.layers.0.mlp.experts.0.up_proj.weight": mx.zeros((16, 8)),
+                "mtp.layers.0.mlp.experts.0.down_proj.weight": mx.zeros((8, 16)),
+                "mtp.layers.0.mlp.experts.1.gate_proj.weight": mx.zeros((16, 8)),
+                "mtp.layers.0.mlp.experts.1.up_proj.weight": mx.zeros((16, 8)),
+                "mtp.layers.0.mlp.experts.1.down_proj.weight": mx.zeros((8, 16)),
+            }
+        )
+        self.assertEqual(
+            sanitized2[
+                "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 16, 8),
+        )
+        self.assertEqual(
+            sanitized2[
+                "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight"
+            ].shape,
+            (2, 8, 16),
+        )
+        self.assertFalse(any("experts." in k for k in sanitized2))
+
     def test_mtp_generate_step_processor_history(self):
         prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
@@ -238,6 +264,15 @@ class TestMTP(unittest.TestCase):
             self.assertGreater(max(seen), len(prompt))
         finally:
             mx.set_default_device(prev_device)
+
+    def test_mtp_rejects_non_positive_num_draft_tokens(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.language_model.mtp = MTPModule(model.language_model.args)
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                list(
+                    mtp_generate_step(mx.array([1, 2, 3]), model, num_draft_tokens=bad)
+                )
 
 
 if __name__ == "__main__":

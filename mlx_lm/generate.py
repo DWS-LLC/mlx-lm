@@ -712,6 +712,8 @@ def mtp_generate_step(
             "acceptance preserves the target distribution only at temperature 0. "
             "Pass sampler=None."
         )
+    if num_draft_tokens <= 0:
+        raise ValueError("num_draft_tokens must be >= 1 for MTP decoding.")
 
     y = prompt.astype(mx.uint32)
     model_cache = (

@@ -1,6 +1,9 @@
 # Copyright © 2026 Apple Inc.
 
+import re
 from dataclasses import dataclass
+
+import mlx.core as mx
 
 from .base import BaseModelArgs
 from .qwen3_5 import Model as Qwen3_5Model
@@ -50,6 +53,21 @@ class Model(Qwen3_5Model):
                 new_weights[f"{prefix}.switch_mlp.down_proj.weight"] = new_weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
+
+        # Per-expert MoE layout (Qwen3.5): experts.<i>.{gate,up,down}_proj.weight.
+        # Stack each projection across experts into switch_mlp.<proj>.weight.
+        per_expert = {}
+        for key in list(new_weights):
+            m = re.fullmatch(
+                r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", key
+            )
+            if m:
+                prefix, expert, proj = m.group(1), int(m.group(2)), m.group(3)
+                per_expert.setdefault((prefix, proj), {})[expert] = new_weights.pop(key)
+        for (prefix, proj), experts in per_expert.items():
+            new_weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
+                [experts[i] for i in sorted(experts)], axis=0
+            )
 
         return self.language_model.sanitize(
             new_weights, is_raw_checkpoint=is_raw_checkpoint
