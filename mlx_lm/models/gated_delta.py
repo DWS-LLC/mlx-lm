@@ -128,7 +128,9 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_per_tok=Fa
 
 
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
-_gated_delta_kernel_per_t = _make_gated_delta_kernel(has_mask=False, vectorized=False, return_per_tok=True)
+_gated_delta_kernel_per_t = _make_gated_delta_kernel(
+    has_mask=False, vectorized=False, return_per_tok=True
+)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
