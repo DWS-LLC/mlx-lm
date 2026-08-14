@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -312,17 +313,22 @@ class MTPModule(nn.Module):
         next_token_ids: mx.array,
         embed_tokens: nn.Embedding,
         cache: Optional[Any] = None,
+        spec_step_idx: int = 0,
+        inputs_embeds: Optional[mx.array] = None,
     ):
-        embeds = embed_tokens(next_token_ids)
-        e = self.pre_fc_norm_embedding(embeds)
+        if inputs_embeds is None:
+            inputs_embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(inputs_embeds)
         h = self.pre_fc_norm_hidden(hidden_states)
         fused = self.fc(mx.concatenate([e, h], axis=-1))
 
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = create_attention_mask(fused, cache[0])
-        for layer, c in zip(self.layers, cache):
-            fused = layer(fused, mask, c)
+        # MTP layers are step-specific heads: select one per speculative step
+        # and advance only its cache.
+        layer_idx = spec_step_idx % len(self.layers)
+        mask = create_attention_mask(fused, cache[layer_idx])
+        fused = self.layers[layer_idx](fused, mask, cache[layer_idx])
         # Return (normed, pre-norm): the pre-norm hidden feeds the next
         # iterative draft step.
         return self.norm(fused), fused
@@ -445,20 +451,37 @@ class TextModel(nn.Module):
             return [KVCache() for _ in self.mtp.layers]
         return []
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        spec_step_idx=0,
+        inputs_embeds=None,
+    ):
         """Run the MTP head and apply the shared lm_head.
 
         Args:
             hidden_states: backbone pre-final-norm hidden state (B, N, H).
-            next_token_ids: next token ids, shape (B, N).
+            next_token_ids: next token ids, shape (B, N). Ignored when
+                ``inputs_embeds`` is provided.
             mtp_cache: KVCache entries for the MTP transformer layer(s).
+            spec_step_idx: the speculative-step index selecting which of the
+                step-specific MTP layers to run.
+            inputs_embeds: pre-computed token embeddings (B, N, H), used for
+                embedding-prefill generation instead of ``next_token_ids``.
 
         Returns:
             (logits, fused) where logits is (B, N, vocab_size) and fused is
             the MTP layer's pre-norm hidden (B, N, H) to feed the next step.
         """
         normed, fused = self.mtp(
-            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+            spec_step_idx=spec_step_idx,
+            inputs_embeds=inputs_embeds,
         )
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(normed), fused
@@ -479,10 +502,22 @@ class TextModel(nn.Module):
 
         # Build the MTP head only when the checkpoint actually ships its
         # weights. A config advertising mtp_num_hidden_layers > 0 with no mtp.*
-        # weights still loads as a plain trunk.
-        if has_mtp_weights and self.args.mtp_num_hidden_layers > 0:
-            if not hasattr(self, "mtp"):
-                self.mtp = MTPModule(self.args)
+        # weights still loads as a plain trunk. When the config omits the count,
+        # infer it from the mtp.layers.<i> weight keys.
+        if has_mtp_weights:
+            if self.args.mtp_num_hidden_layers <= 0:
+                indices = set()
+                for k in weights:
+                    m = re.search(r"mtp\.layers\.(\d+)\.", k)
+                    if m:
+                        indices.add(int(m.group(1)))
+                if indices:
+                    self.args.mtp_num_hidden_layers = max(indices) + 1
+            if self.args.mtp_num_hidden_layers > 0:
+                if not hasattr(self, "mtp"):
+                    self.mtp = MTPModule(self.args)
+            else:
+                weights = {k: v for k, v in weights.items() if "mtp." not in k}
         else:
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
@@ -566,8 +601,21 @@ class Model(nn.Module):
     def model(self):
         return self.language_model.model
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
-        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        spec_step_idx=0,
+        inputs_embeds=None,
+    ):
+        return self.language_model.mtp_forward(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            spec_step_idx=spec_step_idx,
+            inputs_embeds=inputs_embeds,
+        )
 
     def make_mtp_cache(self):
         return self.language_model.make_mtp_cache()

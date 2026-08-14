@@ -314,6 +314,26 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_layer_selection(self):
+        model = _make_model(mtp_num_hidden_layers=2)
+        model.language_model.mtp = MTPModule(model.language_model.args)
+        model.eval()
+        mx.eval(model.parameters())
+
+        mtp_cache = model.make_mtp_cache()
+        self.assertEqual(len(mtp_cache), 2)
+        hidden = mx.random.normal((1, 1, 8))
+        # spec_step_idx=1 selects layer 1 and must advance only its cache.
+        _, _ = model.mtp_forward(hidden, mx.array([[1]]), mtp_cache, spec_step_idx=1)
+        self.assertEqual(mtp_cache[0].offset, 0)
+        self.assertEqual(mtp_cache[1].offset, 1)
+
+    def test_mtp_count_inferred_when_omitted(self):
+        model = _make_model(mtp_num_hidden_layers=0)
+        model.sanitize(_mtp_weights())
+        self.assertTrue(hasattr(model.language_model, "mtp"))
+        self.assertEqual(len(model.language_model.mtp.layers), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
