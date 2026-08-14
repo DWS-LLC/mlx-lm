@@ -726,7 +726,9 @@ class ArraysCache(_BaseCache):
         return self.cache[0] is None
 
     def is_trimmable(self):
-        return True
+        # Only trimmable when capture_states is set (speculative decoding),
+        # so a plain ArraysCache keeps the historical non-trimmable behavior.
+        return self.capture_states
 
     def store_history(self, conv_input, state_per_t):
         """Store per-token states from a batched forward for O(1) rollback."""
