@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    TrimmableArraysCache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -179,6 +180,46 @@ class TestPromptCache(unittest.TestCase):
 
         # Try to make a mask
         mask = loaded[0].make_mask(4)
+
+    def test_save_load_trimmable_arrays_cache(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        cache = [TrimmableArraysCache(size=2)]
+        cache[0][0] = mx.zeros((1, 3, 8))
+        cache[0][1] = mx.zeros((1, 2, 4, 4))
+
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+
+        # ``from_state`` skips ``__init__``, so the transient rollback fields
+        # must be initialized for the loaded cache to be usable in speculative
+        # decoding.
+        self.assertTrue(loaded[0].is_trimmable())
+
+        # Batched capture + trim (model-cache verify path).
+        n_keep = 3
+        conv_input = mx.arange(1 * (n_keep + 4) * 8, dtype=mx.float32).reshape(
+            1, n_keep + 4, 8
+        )
+        state_per_t = mx.arange(1 * 4 * 2 * 4 * 4, dtype=mx.float32).reshape(
+            1, 4, 2, 4, 4
+        )
+        loaded[0].store_history(conv_input, state_per_t, n_keep)
+        self.assertEqual(trim_prompt_cache(loaded, 2), 2)
+        self.assertTrue(mx.array_equal(loaded[0][1], state_per_t[:, 1]))
+        self.assertTrue(mx.array_equal(loaded[0][0], conv_input[:, 2:5]))
+
+        # Sequential capture + trim (draft-cache path); append_history crashes
+        # without an initialized _history.
+        first_state = mx.ones((1, 2, 4, 4))
+        first_conv = mx.zeros((1, n_keep, 8))
+        loaded[0].append_history(first_state, first_conv)
+        loaded[0].append_history(
+            mx.full((1, 2, 4, 4), 2.0), mx.full((1, n_keep, 8), 2.0)
+        )
+        self.assertEqual(trim_prompt_cache(loaded, 1), 1)
+        self.assertTrue(mx.array_equal(loaded[0][1], first_state))
+        self.assertTrue(mx.array_equal(loaded[0][0], first_conv))
 
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer

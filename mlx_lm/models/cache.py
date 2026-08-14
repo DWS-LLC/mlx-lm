@@ -744,6 +744,20 @@ class TrimmableArraysCache(ArraysCache):
         self.capture_states = False
         self._history = []
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # ``_BaseCache.from_state`` builds the object with ``cls.__new__`` and
+        # skips ``__init__``, so the transient rollback fields must be
+        # initialized here or a loaded cache will crash on the first
+        # ``append_history``/``trim``.
+        obj = super().from_state(state, meta_state)
+        obj.capture_states = False
+        obj._history = []
+        obj._state_per_t = None
+        obj._conv_input = None
+        obj._n_keep = None
+        return obj
+
     def is_trimmable(self):
         return True
 
