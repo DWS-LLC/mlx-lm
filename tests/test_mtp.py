@@ -431,6 +431,39 @@ class TestMTP(unittest.TestCase):
         self.assertTrue(hasattr(model.language_model, "mtp"))
         self.assertEqual(len(model.language_model.mtp.layers), 1)
 
+    def test_mtp_rejects_empty_prompt(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.language_model.mtp = MTPModule(model.language_model.args)
+        with self.assertRaises(ValueError):
+            list(mtp_generate_step(mx.array([]), model))
+
+    def test_mtp_recursive_prefill_fills_all_layers(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=2)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            mtp_cache = model.make_mtp_cache()
+            self.assertEqual(len(mtp_cache), 2)
+            hidden = mx.random.normal((1, 3, 8))
+            tokens = mx.array([[2, 3, 4]])
+            # Replicate the recursive prefill: layer 0 consumes the backbone
+            # hidden, layer 1 consumes layer 0's fused output.
+            for j in range(2):
+                _, hidden = model.mtp_forward(
+                    hidden, tokens, mtp_cache, spec_step_idx=j
+                )
+                mx.eval(hidden)
+            mx.eval([c.state for c in mtp_cache])
+            # Every layer's causal cache must be warmed with the prompt.
+            self.assertEqual(mtp_cache[0].offset, 3)
+            self.assertEqual(mtp_cache[1].offset, 3)
+        finally:
+            mx.set_default_device(prev_device)
+
 
 if __name__ == "__main__":
     unittest.main()

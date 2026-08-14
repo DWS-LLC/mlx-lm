@@ -720,7 +720,10 @@ def mtp_generate_step(
             raise ValueError("Model does not support input embeddings.")
         if len(prompt) > 0 and len(prompt) != len(input_embeddings):
             raise ValueError("input_embeddings length must match the prompt length.")
-
+    elif len(prompt) == 0:
+        raise ValueError(
+            "Either input_embeddings or prompt (or both) must be provided."
+        )
     y = prompt.astype(mx.uint32)
     model_cache = (
         prompt_cache if prompt_cache is not None else cache.make_prompt_cache(model)
@@ -812,16 +815,37 @@ def mtp_generate_step(
     if full_embeds is not None:
         tok_emb = model.model.embed_tokens(mx.array([tok0], mx.uint32))
         shifted_embeds = mx.concatenate([full_embeds[1:], tok_emb], axis=0)
-        l_prefill, h = model.mtp_forward(
-            full_hidden, None, mtp_cache, inputs_embeds=shifted_embeds[None]
-        )
+        next_tokens = None
+        inputs_embeds = shifted_embeds[None]
     else:
         shifted = mx.concatenate([prompt[1:], mx.array([tok0], mx.uint32)], axis=0)
-        l_prefill, h = model.mtp_forward(full_hidden, shifted[None], mtp_cache)
+        next_tokens = shifted[None]
+        inputs_embeds = None
+
+    # Prefill every MTP layer recursively: layer 0 consumes the backbone
+    # hidden, each subsequent layer consumes the preceding layer's fused
+    # output, so every depth's causal cache and RoPE offset is warmed with the
+    # prompt context.
+    hidden = full_hidden
+    l_seed = None
+    h_seed = None
+    for j in range(len(mtp_cache)):
+        l, h = model.mtp_forward(
+            hidden,
+            next_tokens,
+            mtp_cache,
+            spec_step_idx=j,
+            inputs_embeds=inputs_embeds,
+        )
+        mx.eval(l, h)
+        if j == 0:
+            l_seed = l
+            h_seed = h
+        hidden = h
     mx.eval([c.state for c in mtp_cache])
     seed_tokens = _append_token(prev_tokens, tok0)
-    d1 = _process_and_sample(seed_tokens, l_prefill[0, -1])[0].item()
-    h = h[:, -1:]
+    d1 = _process_and_sample(seed_tokens, l_seed[0, -1])[0].item()
+    h = h_seed[:, -1:]
     ntoks = 0
     num_draft = 0
     n_accept = 0
