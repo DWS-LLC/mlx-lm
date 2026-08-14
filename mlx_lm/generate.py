@@ -897,11 +897,11 @@ def mtp_generate_step(
             v_logits, v_hidden = model(
                 mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
             )
+            # Arm rollback immediately after the cache-mutating forward: cache
+            # quantization and evaluation can also raise.
+            pending_trim = num_draft + 1
             quantize_cache_fn(model_cache)
             mx.eval(v_logits, v_hidden)
-            # The verification forward appended tok0 plus every draft. None is
-            # committed until its corresponding token has been yielded.
-            pending_trim = num_draft + 1
             v_toks = []
             v_lps = []
             verify_tokens = seed_tokens

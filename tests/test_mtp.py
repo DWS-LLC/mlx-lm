@@ -395,6 +395,48 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_quantization_exception_restores_prompt_cache(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt = mx.array([1, 2, 3])
+            prompt_cache = make_prompt_cache(model)
+            calls = 0
+
+            def fail_during_verify_quantization(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                # Prefill and bootstrap quantization run first; the third call
+                # follows the cache-mutating verification forward.
+                if calls == 3:
+                    raise RuntimeError("quantization failure")
+
+            with patch(
+                "mlx_lm.generate.maybe_quantize_kv_cache",
+                side_effect=fail_during_verify_quantization,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "quantization failure"):
+                    list(
+                        mtp_generate_step(
+                            prompt,
+                            model,
+                            prompt_cache=prompt_cache,
+                            max_tokens=3,
+                            num_draft_tokens=1,
+                        )
+                    )
+
+            for entry in prompt_cache:
+                if isinstance(entry, KVCache):
+                    self.assertEqual(entry.offset, len(prompt))
+        finally:
+            mx.set_default_device(prev_device)
+
     def test_mtp_rejects_non_positive_num_draft_tokens(self):
         model = _make_model(mtp_num_hidden_layers=1)
         model.language_model.mtp = MTPModule(model.language_model.args)
