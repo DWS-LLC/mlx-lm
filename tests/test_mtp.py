@@ -642,6 +642,43 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_final_token_quantization_failure_restores_prompt_cache(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt = mx.array([1])
+            prompt_cache = make_prompt_cache(model)
+            calls = 0
+
+            def fail_during_final_quantization(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                # Bootstrap quantization runs first; max_tokens=1 then takes
+                # the final-token backbone write path.
+                if calls == 2:
+                    raise RuntimeError("final quantization failure")
+
+            with patch(
+                "mlx_lm.generate.maybe_quantize_kv_cache",
+                side_effect=fail_during_final_quantization,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "final quantization failure"):
+                    list(
+                        mtp_generate_step(
+                            prompt, model, prompt_cache=prompt_cache, max_tokens=1
+                        )
+                    )
+
+            for entry in prompt_cache:
+                if isinstance(entry, KVCache):
+                    self.assertEqual(entry.offset, len(prompt))
+        finally:
+            mx.set_default_device(prev_device)
+
     def test_mtp_rejects_non_positive_num_draft_tokens(self):
         model = _make_model(mtp_num_hidden_layers=1)
         model.language_model.mtp = MTPModule(model.language_model.args)

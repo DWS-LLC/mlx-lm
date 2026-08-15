@@ -604,6 +604,39 @@ def speculative_generate_step(
         cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
+    def _snapshot_cache_entries(caches):
+        snapshots = []
+        for c in caches:
+            if isinstance(c, TrimmableArraysCache):
+                snapshots.append(
+                    (
+                        "trimmable",
+                        list(c.cache),
+                        list(c._history),
+                        c._state_per_t,
+                        c._conv_input,
+                        c._n_keep,
+                    )
+                )
+            elif hasattr(c, "offset"):
+                snapshots.append(("offset", c.offset))
+            else:
+                snapshots.append(("none",))
+        return snapshots
+
+    def _restore_cache_entries(caches, snapshots):
+        for c, snapshot in zip(caches, snapshots):
+            if snapshot[0] == "trimmable":
+                _, c.cache, c._history, c._state_per_t, c._conv_input, c._n_keep = (
+                    snapshot
+                )
+                c.cache = list(c.cache)
+                c._history = list(c._history)
+            elif snapshot[0] == "offset":
+                delta = c.offset - snapshot[1]
+                if delta > 0:
+                    c.trim(delta)
+
     def _draft_generate(y, num_draft):
         nonlocal draft_cache_pending
         if num_draft == 0:
@@ -639,6 +672,8 @@ def speculative_generate_step(
     draft_cache_pending = 0
     model_cache_pending = 0
     emitted_in_cycle = False
+    model_cache_snapshot = None
+    draft_cache_snapshot = None
 
     def _record_draft_cache(count):
         nonlocal draft_cache_pending
@@ -656,6 +691,8 @@ def speculative_generate_step(
             draft_cache_pending = 0
             model_cache_pending = 0
             emitted_in_cycle = False
+            model_cache_snapshot = _snapshot_cache_entries(model_cache)
+            draft_cache_snapshot = _snapshot_cache_entries(draft_cache)
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
@@ -706,13 +743,14 @@ def speculative_generate_step(
             _rewind_cache(num_draft, n)
             model_cache_pending = 0
             draft_cache_pending = 0
+            model_cache_snapshot = None
+            draft_cache_snapshot = None
     finally:
-        if model_cache_pending:
-            if emitted_in_cycle:
-                _rewind_cache(num_draft, n)
-            else:
-                cache.trim_prompt_cache(model_cache, model_cache_pending)
-                cache.trim_prompt_cache(draft_cache, draft_cache_pending)
+        if not emitted_in_cycle and model_cache_snapshot is not None:
+            _restore_cache_entries(model_cache, model_cache_snapshot)
+            _restore_cache_entries(draft_cache, draft_cache_snapshot)
+        elif model_cache_pending:
+            _rewind_cache(num_draft, n)
         elif draft_cache_pending:
             cache.trim_prompt_cache(draft_cache, draft_cache_pending)
         # Leave caller-owned caches ready for reuse: capture off, so a later
@@ -922,9 +960,12 @@ def mtp_generate_step(
                     # caller-owned prompt_cache includes it; saving/reusing
                     # that cache for continuation would otherwise be one
                     # token short of the emitted history.
+                    _enable_capture(True)
                     model(mx.array([[tok0]], mx.uint32), cache=model_cache)
+                    pending_trim = 1
                     quantize_cache_fn(model_cache)
                     mx.eval([c.state for c in model_cache])
+                    pending_trim = 0
                     yield tok0, logprobs0, False
                     ntoks += 1
                     break

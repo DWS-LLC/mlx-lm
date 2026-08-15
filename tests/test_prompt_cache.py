@@ -343,28 +343,40 @@ class TestPromptCache(unittest.TestCase):
                 return amount
 
         class Model:
-            def __init__(self, fail_on_call=None):
+            def __init__(self, fail_on_call=None, partial_failure=False):
                 self.calls = 0
                 self.fail_on_call = fail_on_call
+                self.partial_failure = partial_failure
                 self.cache = None
                 self.before_second_cycle = None
 
             def make_cache(self):
-                self.cache = [TrackingCache()]
+                self.cache = [TrackingCache(), TrackingCache()]
                 return self.cache
 
             def __call__(self, y, cache):
                 self.calls += 1
                 # Target call 3 and draft call 5 start cycle two.
                 if self.calls in {3, 5}:
-                    self.before_second_cycle = cache[0].offset
+                    self.before_second_cycle = [entry.offset for entry in cache]
                 if self.calls == self.fail_on_call:
+                    if self.partial_failure:
+                        cache[0].offset += y.shape[1]
                     raise RuntimeError("model failure")
-                cache[0].offset += y.shape[1]
+                for entry in cache:
+                    entry.offset += y.shape[1]
                 return mx.zeros((1, y.shape[1], 4))
 
-        def run_failure(*, target_fails=False, quantization_fails=False):
-            target = Model(fail_on_call=3 if target_fails else None)
+        def run_failure(
+            *,
+            target_fails=False,
+            partial_target_failure=False,
+            quantization_fails=False
+        ):
+            target = Model(
+                fail_on_call=3 if target_fails else None,
+                partial_failure=partial_target_failure,
+            )
             draft = Model()
 
             def quantize(cache, **_kwargs):
@@ -384,13 +396,20 @@ class TestPromptCache(unittest.TestCase):
                         )
                     )
 
-            self.assertEqual(target.cache[0].offset, target.before_second_cycle)
-            self.assertEqual(draft.cache[0].offset, draft.before_second_cycle)
+            self.assertEqual(
+                [entry.offset for entry in target.cache], target.before_second_cycle
+            )
+            self.assertEqual(
+                [entry.offset for entry in draft.cache], draft.before_second_cycle
+            )
 
-        # A target model failure occurs before its forward mutates cache state.
+        # A target model failure occurs before any cache mutation.
         run_failure(target_fails=True)
-        # A quantization failure occurs after the target forward appended the
-        # entire verification batch but before any token was yielded.
+        # A target model can mutate its first layer cache before a later layer
+        # raises; every cache entry must still return to its cycle-start offset.
+        run_failure(target_fails=True, partial_target_failure=True)
+        # A quantization failure occurs after target cache mutation but before
+        # any token was yielded.
         run_failure(quantization_fails=True)
 
     def test_trimmable_arrays_cache_capture_disable_clears(self):
