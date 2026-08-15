@@ -108,6 +108,25 @@ class TestMTP(unittest.TestCase):
         self.assertIn("backbone.safetensors", local_files)
         self.assertIn("mtp-only.safetensors", local_files)
 
+    def test_pipeline_shards_allow_absent_configured_mtp_weights(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.sanitize({})
+        self.assertTrue(hasattr(model.language_model, "mtp"))
+
+        # The converted index has every backbone tensor but no MTP tensor.
+        # Pipeline selection must defer removal to the second load rather than
+        # treating the config-only MTP parameters as an invalid checkpoint.
+        weight_index = {
+            key: "backbone.safetensors"
+            for key, _ in tree_flatten(model.parameters())
+            if not key.startswith("language_model.mtp.")
+        }
+        local_files = utils._pipeline_local_files(model, weight_index)
+        self.assertEqual(local_files, {"backbone.safetensors"})
+
+        with self.assertRaises(ValueError):
+            utils._pipeline_local_files(model, {})
+
     def test_sanitize_no_double_shift_on_converted(self):
         base = mx.arange(8, dtype=mx.float32)
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
@@ -829,6 +848,46 @@ class TestMTP(unittest.TestCase):
         model.language_model.mtp = MTPModule(model.language_model.args)
         with self.assertRaises(ValueError):
             list(mtp_generate_step(mx.array([]), model))
+
+    def test_mtp_embedding_only_prompt_skips_initial_processor(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=1)
+            model.eval()
+            mx.eval(model.parameters())
+
+            prompt = mx.array([], mx.uint32)
+            embeddings = model.model.embed_tokens(mx.array([1], mx.uint32))
+            logits = model(prompt[None], input_embeddings=embeddings[None])
+            mx.eval(logits)
+            expected = mx.argmax(logits[0, -1], axis=-1).item()
+            forced_token = (expected + 1) % model.language_model.args.vocab_size
+            force_bias = mx.array(
+                [[1e6 if i == forced_token else 0.0 for i in range(32)]]
+            )
+            histories = []
+
+            def force_token(tokens, processor_logits):
+                histories.append(len(tokens))
+                return processor_logits + force_bias
+
+            generator = mtp_generate_step(
+                prompt,
+                model,
+                max_tokens=1,
+                input_embeddings=embeddings,
+                logits_processors=[force_token],
+            )
+            try:
+                token, _logprobs, _from_draft = next(generator)
+            finally:
+                generator.close()
+
+            self.assertEqual(token, expected)
+            self.assertEqual(histories, [1])
+        finally:
+            mx.set_default_device(prev_device)
 
     def test_mtp_recursive_prefill_fills_all_layers(self):
         prev_device = mx.default_device()

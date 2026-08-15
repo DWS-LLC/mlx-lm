@@ -544,6 +544,12 @@ def _pipeline_local_files(model, weight_index):
     local_files = set()
     for key, _ in tree_flatten(model.parameters()):
         if (file_name := weight_index.get(key)) is None:
+            # Config-declared MTP layers may have no checkpoint weights. The
+            # second load will remove that head after it sees the non-empty
+            # backbone-only map; all other missing model parameters remain an
+            # invalid converted checkpoint.
+            if key.startswith("language_model.mtp."):
+                continue
             raise ValueError(
                 "Pipeline loading is only supported for MLX converted models."
             )

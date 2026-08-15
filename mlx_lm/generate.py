@@ -756,7 +756,9 @@ def mtp_generate_step(
     )
 
     def _process_and_sample(tokens, logits):
-        if logits_processors:
+        # Match generate_step: an embedding-only prompt has no token history,
+        # so its initial logits must bypass token-based processors.
+        if logits_processors and tokens is not None and len(tokens) > 0:
             if logits.ndim == 1:
                 logits = logits[None]
             for processor in logits_processors:
