@@ -127,6 +127,47 @@ class TestMTP(unittest.TestCase):
         with self.assertRaises(ValueError):
             utils._pipeline_local_files(model, {})
 
+    def test_pipeline_shards_reject_partial_configured_mtp_weights(self):
+        model = _make_model(mtp_num_hidden_layers=1)
+        model.sanitize({})
+        weight_index = {
+            key: "backbone.safetensors"
+            for key, _ in tree_flatten(model.parameters())
+            if not key.startswith("language_model.mtp.")
+        }
+        # One MTP tensor means this is a declared but incomplete head, not the
+        # valid backbone-only fallback.
+        weight_index["language_model.mtp.fc.weight"] = "mtp.safetensors"
+        with self.assertRaises(ValueError):
+            utils._pipeline_local_files(model, weight_index)
+
+    def test_quant_predicate_preserves_mtp_fusion_projection(self):
+        dense_predicate = _make_model(mtp_num_hidden_layers=1).quant_predicate
+        self.assertFalse(dense_predicate("language_model.mtp.fc", None))
+        self.assertTrue(
+            dense_predicate("language_model.model.layers.0.mlp.up_proj", None)
+        )
+
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = _text_config(mtp_num_hidden_layers=1)
+        text_config.update(
+            {
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "shared_expert_intermediate_size": 8,
+            }
+        )
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe", **text_config},
+            }
+        )
+        moe_predicate = qwen3_5_moe.Model(args).quant_predicate
+        self.assertFalse(moe_predicate("language_model.mtp.fc", None))
+
     def test_sanitize_no_double_shift_on_converted(self):
         base = mx.arange(8, dtype=mx.float32)
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"

@@ -557,10 +557,12 @@ class TextModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.args.num_experts <= 0:
-            return None
-
         def predicate(path, _):
+            # Native Qwen MTP keeps the fusion projection in full precision:
+            # its draft logits are highly sensitive to the normalized hidden /
+            # next-token embedding combination.
+            if path.endswith("mtp.fc"):
+                return False
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
             return True

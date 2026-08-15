@@ -542,13 +542,16 @@ def load(
 
 def _pipeline_local_files(model, weight_index):
     local_files = set()
+    mtp_index_keys = {
+        key for key in weight_index if key.startswith("language_model.mtp.")
+    }
     for key, _ in tree_flatten(model.parameters()):
         if (file_name := weight_index.get(key)) is None:
             # Config-declared MTP layers may have no checkpoint weights. The
             # second load will remove that head after it sees the non-empty
-            # backbone-only map; all other missing model parameters remain an
-            # invalid converted checkpoint.
-            if key.startswith("language_model.mtp."):
+            # backbone-only map. Once the index declares any MTP key, though,
+            # every config-declared MTP parameter must be present.
+            if key.startswith("language_model.mtp.") and not mtp_index_keys:
                 continue
             raise ValueError(
                 "Pipeline loading is only supported for MLX converted models."
@@ -559,11 +562,7 @@ def _pipeline_local_files(model, weight_index):
     # only after their shards are downloaded. It is absent from the initial
     # config-only parameter tree, so include every MTP shard on every pipeline
     # rank before the second model load.
-    local_files.update(
-        file_name
-        for key, file_name in weight_index.items()
-        if key.startswith("language_model.mtp.")
-    )
+    local_files.update(weight_index[key] for key in mtp_index_keys)
     return local_files
 
 

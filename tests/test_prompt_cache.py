@@ -4,6 +4,7 @@ import copy
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 
@@ -324,6 +325,60 @@ class TestPromptCache(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             next(gen)
+
+    def test_speculative_exception_does_not_reuse_prior_accept_count(self):
+        class TrackingCache:
+            def __init__(self):
+                self.trim_calls = []
+
+            @property
+            def state(self):
+                return []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, amount):
+                self.trim_calls.append(amount)
+                return amount
+
+        class Model:
+            def __init__(self, fail_on_call=None):
+                self.calls = 0
+                self.fail_on_call = fail_on_call
+                self.cache = None
+
+            def make_cache(self):
+                self.cache = [TrackingCache()]
+                return self.cache
+
+            def __call__(self, y, cache):
+                self.calls += 1
+                if self.calls == self.fail_on_call:
+                    raise RuntimeError("draft failure")
+                return mx.zeros((1, y.shape[1], 4))
+
+        # The first round accepts all three drafts. In the next round only one
+        # draft is requested and the draft model fails before verification.
+        # The finally path must not reuse n=3 and request a negative trim.
+        target = Model()
+        draft = Model(fail_on_call=5)
+        with patch("mlx_lm.generate.maybe_quantize_kv_cache"):
+            with self.assertRaisesRegex(RuntimeError, "draft failure"):
+                list(
+                    speculative_generate_step(
+                        mx.array([1, 2, 3]),
+                        target,
+                        draft,
+                        max_tokens=5,
+                        num_draft_tokens=3,
+                    )
+                )
+
+        for tracked_model in (target, draft):
+            self.assertTrue(
+                all(amount >= 0 for amount in tracked_model.cache[0].trim_calls)
+            )
 
     def test_trimmable_arrays_cache_capture_disable_clears(self):
         cache = TrimmableArraysCache(size=2)
