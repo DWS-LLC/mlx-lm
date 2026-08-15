@@ -345,6 +345,65 @@ class TestMTP(unittest.TestCase):
             )
         )
 
+    def test_top_level_raw_dense_backbone_shifts_norms(self):
+        base = mx.arange(8, dtype=mx.float32)
+        model = _make_model(mtp_num_hidden_layers=0)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.input_layernorm.weight": base,
+                "model.norm.weight": base,
+                "model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 4, 3)),
+            }
+        )
+
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.layers.0.input_layernorm.weight"],
+                base + 1.0,
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(sanitized["language_model.model.norm.weight"], base + 1.0)
+        )
+
+    def test_top_level_raw_moe_backbone_shifts_norms(self):
+        from mlx_lm.models import qwen3_5_moe
+
+        text_config = _text_config(mtp_num_hidden_layers=0)
+        text_config.update(
+            {
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "shared_expert_intermediate_size": 8,
+            }
+        )
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe", **text_config},
+            }
+        )
+        model = qwen3_5_moe.Model(args)
+        base = mx.arange(8, dtype=mx.float32)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.input_layernorm.weight": base,
+                "model.norm.weight": base,
+                "model.layers.0.linear_attn.conv1d.weight": mx.zeros((8, 4, 3)),
+            }
+        )
+
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.layers.0.input_layernorm.weight"],
+                base + 1.0,
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(sanitized["language_model.model.norm.weight"], base + 1.0)
+        )
+
     def test_moe_expert_ids_must_be_complete(self):
         from mlx_lm.models import qwen3_5_moe
 

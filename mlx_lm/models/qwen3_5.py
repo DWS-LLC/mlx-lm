@@ -639,9 +639,12 @@ class Model(nn.Module):
 
         # Track the backbone and MTP provenance separately so a converted
         # language_model.* backbone combined with raw standalone mtp.* weights
-        # only shifts the MTP norms. Leftover vision tensors must not flip a
-        # converted checkpoint to "raw" (which would double-shift norms).
-        is_raw_backbone = any(k.startswith("model.language_model.") for k in weights)
+        # only shifts the MTP norms. Every supported raw backbone layout enters
+        # as model.* (including text-only model.layers.*); vision keys are not
+        # language weights and must not flip a converted checkpoint to "raw".
+        is_raw_backbone = any(
+            k.startswith("model.") and not _is_vision(k) for k in weights
+        )
         is_raw_mtp = any(k.startswith("mtp.") for k in weights)
         sanitized = {}
         for key, value in weights.items():

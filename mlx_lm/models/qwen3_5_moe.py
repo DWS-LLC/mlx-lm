@@ -28,9 +28,12 @@ class Model(Qwen3_5Model):
             return k.startswith("vision_tower") or k.startswith("model.visual")
 
         # Backbone and MTP provenance are tracked separately (see the base
-        # Model.sanitize): a converted backbone with raw mtp.* weights must
-        # shift only the MTP norms.
-        is_raw_backbone = any(k.startswith("model.language_model.") for k in weights)
+        # Model.sanitize). Every supported raw language backbone enters as
+        # model.* (including text-only model.layers.*); model.visual.* is not
+        # language state and must not mark a converted checkpoint raw.
+        is_raw_backbone = any(
+            k.startswith("model.") and not _is_vision(k) for k in weights
+        )
         is_raw_mtp = any(k.startswith("mtp.") for k in weights)
         new_weights = {}
         for key, value in weights.items():
