@@ -776,6 +776,7 @@ def mtp_generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     input_embeddings: Optional[mx.array] = None,
+    exact_verification: bool = True,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """Greedy speculative decoding with the model's native MTP head.
 
@@ -864,6 +865,10 @@ def mtp_generate_step(
         for c in model_cache:
             if isinstance(c, TrimmableArraysCache):
                 c.capture_states = on
+
+    def _enable_exact_verification(on):
+        for c in model_cache:
+            c.exact_step = on
 
     def _snapshot_model_cache():
         snapshots = []
@@ -1119,6 +1124,7 @@ def mtp_generate_step(
             verify_in_progress = True
             verify_emitted = False
             _enable_capture(True)
+            _enable_exact_verification(exact_verification)
             v_logits, v_hidden = model(
                 mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
             )
@@ -1126,6 +1132,7 @@ def mtp_generate_step(
             # quantization and evaluation can also raise.
             pending_trim = num_draft + 1
             quantize_cache_fn(model_cache)
+            _enable_exact_verification(False)
             mx.eval(v_logits, v_hidden)
             v_toks = []
             v_lps = []
@@ -1200,6 +1207,7 @@ def mtp_generate_step(
         elif pending_trim:
             cache.trim_prompt_cache(model_cache, pending_trim)
         _enable_capture(False)
+        _enable_exact_verification(False)
         _enable_mtp_capture(False)
 
 

@@ -430,6 +430,37 @@ class TextModel(nn.Module):
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
     ) -> mx.array:
+        # Metal batch GEMM/attention is not bit-identical to repeated S=1
+        # decode. Exact speculative verification marks its caches and routes
+        # the target batch through the same S=1 path as greedy generation.
+        if (
+            cache is not None
+            and inputs.shape[1] > 1
+            and any(getattr(c, "exact_step", False) for c in cache)
+        ):
+            outputs = []
+            hiddens = []
+            for i in range(inputs.shape[1]):
+                result = self(
+                    inputs[:, i : i + 1],
+                    cache=cache,
+                    input_embeddings=(
+                        input_embeddings[:, i : i + 1]
+                        if input_embeddings is not None
+                        else None
+                    ),
+                    return_hidden=return_hidden,
+                )
+                if return_hidden:
+                    out, hidden = result
+                    outputs.append(out)
+                    hiddens.append(hidden)
+                else:
+                    outputs.append(result)
+            if return_hidden:
+                return mx.concatenate(outputs, axis=1), mx.concatenate(hiddens, axis=1)
+            return mx.concatenate(outputs, axis=1)
+
         hidden = self.model(inputs, cache, input_embeddings=input_embeddings)
         normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
