@@ -177,6 +177,59 @@ class TestMTP(unittest.TestCase):
         finally:
             mx.set_default_device(prev_device)
 
+    def test_mtp_multi_layer_reconciliation_is_recursive(self):
+        prev_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            model = _make_model(mtp_num_hidden_layers=2)
+            model.language_model.mtp = MTPModule(model.language_model.args)
+            model.eval()
+            mx.eval(model.parameters())
+
+            calls = []
+            mtp_forward = model.mtp_forward
+
+            def record_mtp_forward(hidden_states, next_token_ids, mtp_cache, **kwargs):
+                logits, fused = mtp_forward(
+                    hidden_states, next_token_ids, mtp_cache, **kwargs
+                )
+                calls.append((kwargs.get("spec_step_idx", 0), hidden_states, fused))
+                return logits, fused
+
+            # Force target and MTP argmaxes to agree. The first cycle accepts a
+            # draft and therefore exercises reconciliation before generation
+            # reaches the final direct-backbone token.
+            force_token = mx.array([[1e6] + [0.0] * 31])
+            with patch.object(model, "mtp_forward", side_effect=record_mtp_forward):
+                generated = list(
+                    mtp_generate_step(
+                        mx.array([1, 2, 3]),
+                        model,
+                        max_tokens=3,
+                        num_draft_tokens=1,
+                        logits_processors=[
+                            lambda _tokens, logits: logits + force_token
+                        ],
+                    )
+                )
+
+            self.assertEqual([token for token, _lp, _draft in generated], [0, 0, 0])
+            self.assertTrue(any(from_draft for _token, _lp, from_draft in generated))
+
+            # The only one-token MTP calls are the reconciliation chain. Its
+            # layer-1 input must be layer 0's fused output, not a fresh
+            # backbone hidden-state slice.
+            reconcile_calls = [call for call in calls if call[1].shape[1] == 1]
+            self.assertEqual(
+                [step for step, _hidden, _fused in reconcile_calls], [0, 1]
+            )
+            _, _layer0_input, layer0_fused = reconcile_calls[0]
+            _, layer1_input, _layer1_fused = reconcile_calls[1]
+            mx.eval(layer0_fused, layer1_input)
+            self.assertTrue(mx.allclose(layer1_input, layer0_fused))
+        finally:
+            mx.set_default_device(prev_device)
+
     def test_mtp_cache_prefill(self):
         model = _make_model(mtp_num_hidden_layers=1)
         model.language_model.mtp = MTPModule(model.language_model.args)

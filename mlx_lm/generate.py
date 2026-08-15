@@ -950,24 +950,27 @@ def mtp_generate_step(
             _enable_capture(False)
 
             # Reconcile the MTP cache: drop each layer's draft-appended slots
-            # (which used the MTP head's own hidden approximation) and re-append
-            # the confirmed positions per-token through the layer that drafted
-            # them, using the backbone's verified hidden states.
+            # (which used the MTP head's own hidden approximation) and rebuild
+            # each MTP-depth chain recursively. Layer 0 consumes the verified
+            # backbone hidden for that position; deeper layers consume the
+            # preceding MTP layer's fused output, matching recursive prefill.
             for j, cnt in enumerate(appended):
                 if cnt:
                     mtp_cache[j].trim(cnt)
             confirm_tokens = draft[1 : n_accept + 1] + [v_toks[n_accept]]
             confirm_hidden = v_hidden[:, : n_accept + 1]
-            for j in range(n_accept + 1):
-                l_next, h = model.mtp_forward(
-                    confirm_hidden[:, j : j + 1],
-                    mx.array([[confirm_tokens[j]]], mx.uint32),
+            for j, confirm_token in enumerate(confirm_tokens):
+                if j % len(mtp_cache) == 0:
+                    reconcile_hidden = confirm_hidden[:, j : j + 1]
+                l_next, reconcile_hidden = model.mtp_forward(
+                    reconcile_hidden,
+                    mx.array([[confirm_token]], mx.uint32),
                     mtp_cache,
                     spec_step_idx=j,
                 )
-                mx.eval(l_next, h)
+                mx.eval(l_next, reconcile_hidden)
             d1 = _process_and_sample(seed_tokens, l_next[0, -1])[0].item()
-            h = h[:, -1:]
+            h = reconcile_hidden
     finally:
         if pending_trim:
             cache.trim_prompt_cache(model_cache, pending_trim)
