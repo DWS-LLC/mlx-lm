@@ -326,10 +326,10 @@ class TestPromptCache(unittest.TestCase):
         with self.assertRaises(ValueError):
             next(gen)
 
-    def test_speculative_exception_does_not_reuse_prior_accept_count(self):
+    def test_speculative_exception_restores_exact_cache_offsets(self):
         class TrackingCache:
             def __init__(self):
-                self.trim_calls = []
+                self.offset = 0
 
             @property
             def state(self):
@@ -339,7 +339,7 @@ class TestPromptCache(unittest.TestCase):
                 return True
 
             def trim(self, amount):
-                self.trim_calls.append(amount)
+                self.offset -= amount
                 return amount
 
         class Model:
@@ -347,6 +347,7 @@ class TestPromptCache(unittest.TestCase):
                 self.calls = 0
                 self.fail_on_call = fail_on_call
                 self.cache = None
+                self.before_second_cycle = None
 
             def make_cache(self):
                 self.cache = [TrackingCache()]
@@ -354,31 +355,43 @@ class TestPromptCache(unittest.TestCase):
 
             def __call__(self, y, cache):
                 self.calls += 1
+                # Target call 3 and draft call 5 start cycle two.
+                if self.calls in {3, 5}:
+                    self.before_second_cycle = cache[0].offset
                 if self.calls == self.fail_on_call:
-                    raise RuntimeError("draft failure")
+                    raise RuntimeError("model failure")
+                cache[0].offset += y.shape[1]
                 return mx.zeros((1, y.shape[1], 4))
 
-        # The first round accepts all three drafts. In the next round only one
-        # draft is requested and the draft model fails before verification.
-        # The finally path must not reuse n=3 and request a negative trim.
-        target = Model()
-        draft = Model(fail_on_call=5)
-        with patch("mlx_lm.generate.maybe_quantize_kv_cache"):
-            with self.assertRaisesRegex(RuntimeError, "draft failure"):
-                list(
-                    speculative_generate_step(
-                        mx.array([1, 2, 3]),
-                        target,
-                        draft,
-                        max_tokens=5,
-                        num_draft_tokens=3,
-                    )
-                )
+        def run_failure(*, target_fails=False, quantization_fails=False):
+            target = Model(fail_on_call=3 if target_fails else None)
+            draft = Model()
 
-        for tracked_model in (target, draft):
-            self.assertTrue(
-                all(amount >= 0 for amount in tracked_model.cache[0].trim_calls)
-            )
+            def quantize(cache, **_kwargs):
+                if quantization_fails and cache is target.cache and target.calls == 3:
+                    raise RuntimeError("quantization failure")
+
+            error = "model failure" if target_fails else "quantization failure"
+            with patch("mlx_lm.generate.maybe_quantize_kv_cache", side_effect=quantize):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    list(
+                        speculative_generate_step(
+                            mx.array([1, 2, 3]),
+                            target,
+                            draft,
+                            max_tokens=5,
+                            num_draft_tokens=3,
+                        )
+                    )
+
+            self.assertEqual(target.cache[0].offset, target.before_second_cycle)
+            self.assertEqual(draft.cache[0].offset, draft.before_second_cycle)
+
+        # A target model failure occurs before its forward mutates cache state.
+        run_failure(target_fails=True)
+        # A quantization failure occurs after the target forward appended the
+        # entire verification batch but before any token was yielded.
+        run_failure(quantization_fails=True)
 
     def test_trimmable_arrays_cache_capture_disable_clears(self):
         cache = TrimmableArraysCache(size=2)

@@ -559,9 +559,14 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, n_predict=1, on_cache_update=None):
         with mx.stream(generation_stream):
             logits = model(y[None], cache=cache)
+            # A model forward can mutate its cache before quantization or eval.
+            # Arm rollback only after it returned successfully, and before any
+            # later exception-prone operation.
+            if on_cache_update is not None:
+                on_cache_update(y.size)
             logits = logits[:, -n_predict:, :]
 
             quantize_cache_fn(cache)
@@ -600,15 +605,17 @@ def speculative_generate_step(
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
-        nonlocal draft_cache_steps
+        nonlocal draft_cache_pending
         if num_draft == 0:
             return mx.array([], mx.uint32)
         ys = []
         for _ in range(num_draft):
-            # _step may mutate the draft cache before cache quantization or
-            # evaluation raises, so account for this step first.
-            draft_cache_steps += 1
-            y, _ = _step(draft_model, draft_cache, y)
+            y, _ = _step(
+                draft_model,
+                draft_cache,
+                y,
+                on_cache_update=lambda count: _record_draft_cache(count),
+            )
             mx.async_eval(y)
             ys.append(y)
         return mx.concatenate(ys)
@@ -625,26 +632,42 @@ def speculative_generate_step(
         if isinstance(c, TrimmableArraysCache):
             c.capture_states = True
     ntoks = 0
-    # Set these so the finally block can restore only mutations from the
-    # current speculative cycle.
+    # Pending counts describe cache positions appended by the current cycle
+    # but not yet reconciled or emitted.
     num_draft = 0
     n = 0
-    draft_cache_steps = 0
-    model_cache_pending = False
+    draft_cache_pending = 0
+    model_cache_pending = 0
+    emitted_in_cycle = False
+
+    def _record_draft_cache(count):
+        nonlocal draft_cache_pending
+        draft_cache_pending += count
+
+    def _record_model_cache(count):
+        nonlocal model_cache_pending
+        model_cache_pending += count
+
     try:
         while True:
-            # Never carry an accepted count into an exception path in the next
-            # cycle. The cache mutations below belong only to this cycle.
+            # Never carry an accepted count or pending cache state into the
+            # next speculative cycle.
             n = 0
-            draft_cache_steps = 0
-            model_cache_pending = False
+            draft_cache_pending = 0
+            model_cache_pending = 0
+            emitted_in_cycle = False
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
-            model_cache_pending = True
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+            tokens, logprobs = _step(
+                model,
+                model_cache,
+                y,
+                num_draft + 1,
+                on_cache_update=lambda count: _record_model_cache(count),
+            )
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
@@ -655,11 +678,13 @@ def speculative_generate_step(
                     break
                 n += 1
                 ntoks += 1
+                emitted_in_cycle = True
                 yield tn, lpn, True
                 if ntoks == max_tokens:
                     break
             if ntoks < max_tokens:
                 ntoks += 1
+                emitted_in_cycle = True
                 yield tokens[n], logprobs[n], False
 
             if ntoks == max_tokens:
@@ -679,15 +704,17 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
-            model_cache_pending = False
-            draft_cache_steps = 0
+            model_cache_pending = 0
+            draft_cache_pending = 0
     finally:
         if model_cache_pending:
-            _rewind_cache(num_draft, n)
-        elif draft_cache_steps:
-            # The first draft step processes the already-emitted draft_y;
-            # only later speculative steps require rollback without verify.
-            cache.trim_prompt_cache(draft_cache, max(draft_cache_steps - 1, 0))
+            if emitted_in_cycle:
+                _rewind_cache(num_draft, n)
+            else:
+                cache.trim_prompt_cache(model_cache, model_cache_pending)
+                cache.trim_prompt_cache(draft_cache, draft_cache_pending)
+        elif draft_cache_pending:
+            cache.trim_prompt_cache(draft_cache, draft_cache_pending)
         # Leave caller-owned caches ready for reuse: capture off, so a later
         # prefill (or prompt-cache reuse) doesn't materialize or consume stale
         # rollback state.
