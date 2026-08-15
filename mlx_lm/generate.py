@@ -777,6 +777,7 @@ def mtp_generate_step(
     quantized_kv_start: int = 0,
     input_embeddings: Optional[mx.array] = None,
     exact_verification: bool = True,
+    verify_margin: float = 0.5,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """Greedy speculative decoding with the model's native MTP head.
 
@@ -1119,41 +1120,82 @@ def mtp_generate_step(
                 tok_cur = _process_and_sample(draft_tokens, l_mtp[0, -1])[0].item()
                 draft.append(tok_cur)
 
-            # Batched verify with capture enabled for O(1) backbone rollback.
+            # Fast batched verification is followed by exact sequential replay
+            # only when a low-margin batch decision is susceptible to Metal
+            # batch-vs-step rounding drift. exact_verification forces replay
+            # for every batch and is kept as a reference mode.
+            batch_verified = not exact_verification
             verify_cache_snapshot = _snapshot_model_cache()
             verify_in_progress = True
             verify_emitted = False
             _enable_capture(True)
-            _enable_exact_verification(exact_verification)
+            _enable_exact_verification(False)
             v_logits, v_hidden = model(
                 mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
             )
-            # Arm rollback immediately after the cache-mutating forward: cache
-            # quantization and evaluation can also raise.
             pending_trim = num_draft + 1
             quantize_cache_fn(model_cache)
-            _enable_exact_verification(False)
             mx.eval(v_logits, v_hidden)
-            v_toks = []
-            v_lps = []
-            verify_tokens = seed_tokens
-            for i in range(num_draft + 1):
-                vt, vlp = _process_and_sample(verify_tokens, v_logits[0, i])
-                v_toks.append(vt.item())
-                v_lps.append(vlp)
-                if i < num_draft:
-                    verify_tokens = _append_token(verify_tokens, draft[i + 1])
+            sorted_logits = mx.sort(v_logits[0], axis=-1)
+            margins = sorted_logits[:, -1] - sorted_logits[:, -2]
+            mx.eval(margins)
+            needs_replay = exact_verification or bool(
+                mx.any(margins <= verify_margin).item()
+            )
 
-            n_accept = 0
-            while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
-                n_accept += 1
-            pending_trim -= 1
+            if needs_replay:
+                _restore_model_cache(verify_cache_snapshot)
+                pending_trim = 0
+                _enable_capture(False)
+                _enable_exact_verification(True)
+                v_toks = []
+                v_lps = []
+                exact_hiddens = []
+                verify_tokens = seed_tokens
+                current = tok0
+                for i in range(num_draft + 1):
+                    exact_logits, exact_hidden = model(
+                        mx.array([[current]], mx.uint32),
+                        cache=model_cache,
+                        return_hidden=True,
+                    )
+                    quantize_cache_fn(model_cache)
+                    mx.eval(exact_logits, exact_hidden)
+                    vt, vlp = _process_and_sample(verify_tokens, exact_logits[0, -1])
+                    v_toks.append(vt.item())
+                    v_lps.append(vlp)
+                    exact_hiddens.append(exact_hidden)
+                    if i == num_draft or vt.item() != draft[i + 1]:
+                        break
+                    current = draft[i + 1]
+                    verify_tokens = _append_token(verify_tokens, current)
+                n_accept = len(v_toks) - 1
+                v_hidden = mx.concatenate(exact_hiddens, axis=1)
+                pending_trim = len(v_toks)
+                batch_verified = False
+                _enable_exact_verification(False)
+            else:
+                v_toks = []
+                v_lps = []
+                verify_tokens = seed_tokens
+                for i in range(num_draft + 1):
+                    vt, vlp = _process_and_sample(verify_tokens, v_logits[0, i])
+                    v_toks.append(vt.item())
+                    v_lps.append(vlp)
+                    if i < num_draft:
+                        verify_tokens = _append_token(verify_tokens, draft[i + 1])
+                n_accept = 0
+                while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
+                    n_accept += 1
+            if pending_trim:
+                pending_trim -= 1
             verify_emitted = True
             yield tok0, logprobs0, False
             ntoks += 1
             prev_tokens = _append_token(prev_tokens, tok0)
             for i in range(n_accept):
-                pending_trim -= 1
+                if pending_trim:
+                    pending_trim -= 1
                 yield draft[i + 1], v_lps[i], True
                 ntoks += 1
                 prev_tokens = _append_token(prev_tokens, draft[i + 1])
@@ -1168,11 +1210,12 @@ def mtp_generate_step(
             # The next cycle's seed history includes the just-confirmed token.
             seed_tokens = _append_token(prev_tokens, tok0)
 
-            cache.trim_prompt_cache(model_cache, pending_trim)
+            if batch_verified:
+                cache.trim_prompt_cache(model_cache, pending_trim)
+                _enable_capture(False)
             pending_trim = 0
             verify_cache_snapshot = None
             verify_in_progress = False
-            _enable_capture(False)
 
             # Reconcile the MTP cache: drop each layer's draft-appended slots
             # (which used the MTP head's own hidden approximation) and rebuild
