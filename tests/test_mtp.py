@@ -7,6 +7,7 @@ from unittest.mock import patch
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from mlx_lm import utils
 from mlx_lm.generate import mtp_generate_step, stream_generate
 from mlx_lm.models.cache import KVCache, TrimmableArraysCache, make_prompt_cache
 from mlx_lm.models.qwen3_5 import Model, ModelArgs, MTPModule
@@ -88,6 +89,24 @@ class TestMTP(unittest.TestCase):
         self.assertTrue(
             any(key.startswith("language_model.mtp.layers.1.") for key in keys)
         )
+
+    def test_pipeline_shards_include_configless_mtp_weights(self):
+        # The first pipeline model load sees config only. A zero MTP count
+        # therefore contributes no mtp.* parameter keys to tree_flatten.
+        model = _make_model(mtp_num_hidden_layers=0)
+        model.sanitize({})
+        self.assertFalse(hasattr(model.language_model, "mtp"))
+
+        weight_index = {
+            key: "backbone.safetensors" for key, _ in tree_flatten(model.parameters())
+        }
+        weight_index["language_model.mtp.layers.0.self_attn.q_proj.weight"] = (
+            "mtp-only.safetensors"
+        )
+
+        local_files = utils._pipeline_local_files(model, weight_index)
+        self.assertIn("backbone.safetensors", local_files)
+        self.assertIn("mtp-only.safetensors", local_files)
 
     def test_sanitize_no_double_shift_on_converted(self):
         base = mx.arange(8, dtype=mx.float32)

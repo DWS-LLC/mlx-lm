@@ -540,6 +540,27 @@ def load(
         return model, tokenizer
 
 
+def _pipeline_local_files(model, weight_index):
+    local_files = set()
+    for key, _ in tree_flatten(model.parameters()):
+        if (file_name := weight_index.get(key)) is None:
+            raise ValueError(
+                "Pipeline loading is only supported for MLX converted models."
+            )
+        local_files.add(file_name)
+
+    # An MTP head may be inferred from converted language_model.mtp.* weights
+    # only after their shards are downloaded. It is absent from the initial
+    # config-only parameter tree, so include every MTP shard on every pipeline
+    # rank before the second model load.
+    local_files.update(
+        file_name
+        for key, file_name in weight_index.items()
+        if key.startswith("language_model.mtp.")
+    )
+    return local_files
+
+
 def sharded_load(
     repo,
     pipeline_group: Optional[mx.distributed.Group] = None,
@@ -598,13 +619,7 @@ def sharded_load(
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
-        local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        local_files = _pipeline_local_files(model, weight_index)
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
@@ -715,8 +730,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -740,8 +754,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
