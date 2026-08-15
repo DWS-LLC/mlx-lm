@@ -736,6 +736,88 @@ class TestMTP(unittest.TestCase):
         self.assertEqual(mtp_cache[0].offset, 0)
         self.assertEqual(mtp_cache[1].offset, 1)
 
+    def test_shard_includes_dense_mtp_decoder_layer(self):
+        class Group:
+            def size(self):
+                return 1
+
+            def rank(self):
+                return 0
+
+        model = _make_model(mtp_num_hidden_layers=1)
+        mtp_layer = model.language_model.mtp.layers[0]
+        sharded_linear = []
+
+        def record_linear(linear, *_args, **_kwargs):
+            sharded_linear.append(linear)
+            return linear
+
+        with patch(
+            "mlx_lm.models.qwen3_5.shard_linear", side_effect=record_linear
+        ), patch("mlx_lm.models.qwen3_5.shard_inplace"):
+            model.shard(Group())
+
+        sharded_linear_ids = {id(linear) for linear in sharded_linear}
+        for linear in (
+            mtp_layer.self_attn.q_proj,
+            mtp_layer.self_attn.k_proj,
+            mtp_layer.self_attn.v_proj,
+            mtp_layer.self_attn.o_proj,
+            mtp_layer.mlp.gate_proj,
+            mtp_layer.mlp.up_proj,
+            mtp_layer.mlp.down_proj,
+        ):
+            self.assertIn(id(linear), sharded_linear_ids)
+
+    def test_shard_includes_moe_mtp_decoder_layer(self):
+        from mlx_lm.models import qwen3_5_moe
+
+        class Group:
+            def size(self):
+                return 1
+
+            def rank(self):
+                return 0
+
+        text_config = _text_config(mtp_num_hidden_layers=1)
+        text_config.update(
+            {
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "shared_expert_intermediate_size": 8,
+            }
+        )
+        args = qwen3_5_moe.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {"model_type": "qwen3_5_moe", **text_config},
+            }
+        )
+        model = qwen3_5_moe.Model(args)
+        mtp_layer = model.language_model.mtp.layers[0]
+        sharded_inplace = []
+
+        def record_inplace(module, *_args, **_kwargs):
+            sharded_inplace.append(module)
+
+        with patch(
+            "mlx_lm.models.qwen3_5.shard_linear",
+            side_effect=lambda linear, *_a, **_k: linear,
+        ), patch("mlx_lm.models.qwen3_5.shard_inplace", side_effect=record_inplace):
+            model.shard(Group())
+
+        sharded_inplace_ids = {id(module) for module in sharded_inplace}
+        for module in (
+            mtp_layer.mlp.shared_expert.gate_proj,
+            mtp_layer.mlp.shared_expert.up_proj,
+            mtp_layer.mlp.shared_expert.down_proj,
+            mtp_layer.mlp.switch_mlp.gate_proj,
+            mtp_layer.mlp.switch_mlp.up_proj,
+            mtp_layer.mlp.switch_mlp.down_proj,
+        ):
+            self.assertIn(id(module), sharded_inplace_ids)
+
     def test_mtp_count_inferred_when_omitted(self):
         model = _make_model(mtp_num_hidden_layers=0)
         model.sanitize(_mtp_weights())

@@ -685,9 +685,10 @@ class Model(nn.Module):
 
             layer.update(tree_map(_repeat, layer.parameters()))
 
-        for layer in self.layers:
-            # Linear attention
-            if layer.is_linear:
+        def shard_decoder_layer_inplace(layer):
+            # MTPDecoderLayer is full-attention-only; backbone DecoderLayer
+            # carries is_linear for its GatedDeltaNet layers.
+            if getattr(layer, "is_linear", False):
                 kd = layer.linear_attn.key_dim
                 layer.linear_attn.sharding_group = group
                 shard_inplace(layer.linear_attn.conv1d, conv_sharding(kd), group=group)
@@ -719,8 +720,6 @@ class Model(nn.Module):
                 layer.linear_attn.key_dim //= N
                 layer.linear_attn.value_dim //= N
                 layer.linear_attn.conv_dim //= N
-
-            # Softmax attention
             else:
                 layer.self_attn.o_proj = shard_linear(
                     layer.self_attn.o_proj, "sharded-to-all", group=group
@@ -745,7 +744,6 @@ class Model(nn.Module):
                     1, layer.self_attn.num_key_value_heads // N
                 )
 
-            # MLP
             if isinstance(layer.mlp, MLP):
                 layer.mlp.gate_proj = shard_linear(
                     layer.mlp.gate_proj, "all-to-sharded", group=group
@@ -756,8 +754,6 @@ class Model(nn.Module):
                 layer.mlp.up_proj = shard_linear(
                     layer.mlp.up_proj, "all-to-sharded", group=group
                 )
-
-            # MoE
             else:
                 layer.mlp.sharding_group = group
                 shard_inplace(
@@ -778,6 +774,12 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
+
+        for layer in self.layers:
+            shard_decoder_layer_inplace(layer)
+        if hasattr(self.language_model, "mtp"):
+            for layer in self.language_model.mtp.layers:
+                shard_decoder_layer_inplace(layer)
 
     @property
     def layers(self):
