@@ -14,7 +14,7 @@ from .base import (
     create_attention_mask,
     create_ssm_mask,
 )
-from .cache import KVCache, TrimmableArraysCache
+from .cache import KVCache, TrimmableArraysCache, TrimmableRotatingKVCache
 from .gated_delta import gated_delta_update, gated_delta_update_per_t
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -450,10 +450,14 @@ class TextModel(nn.Module):
             for l in self.layers
         ]
 
-    def make_mtp_cache(self):
-        """Return a fresh list of KVCache entries for the MTP layer(s)."""
+    def make_mtp_cache(self, max_size=None):
+        """Return fresh full or rollback-safe bounded MTP attention caches."""
         if hasattr(self, "mtp"):
-            return [KVCache() for _ in self.mtp.layers]
+            cache_cls = KVCache if max_size is None else TrimmableRotatingKVCache
+            return [
+                cache_cls() if max_size is None else cache_cls(max_size)
+                for _ in self.mtp.layers
+            ]
         return []
 
     def mtp_forward(
@@ -491,6 +495,25 @@ class TextModel(nn.Module):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(normed), fused
         return self.lm_head(normed), fused
+
+    def mtp_hidden(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        spec_step_idx=0,
+        inputs_embeds=None,
+    ):
+        """Run an MTP layer without the shared lm_head projection."""
+        _, fused = self.mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+            spec_step_idx=spec_step_idx,
+            inputs_embeds=inputs_embeds,
+        )
+        return fused
 
     def sanitize(self, weights, is_raw_backbone=False, is_raw_mtp=False):
         has_mtp_weights = any("mtp." in k for k in weights)
@@ -612,6 +635,22 @@ class Model(nn.Module):
             return_hidden=return_hidden,
         )
 
+    def mtp_hidden(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        spec_step_idx=0,
+        inputs_embeds=None,
+    ):
+        return self.language_model.mtp_hidden(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            spec_step_idx=spec_step_idx,
+            inputs_embeds=inputs_embeds,
+        )
+
     @property
     def model(self):
         return self.language_model.model
@@ -632,8 +671,8 @@ class Model(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
-    def make_mtp_cache(self):
-        return self.language_model.make_mtp_cache()
+    def make_mtp_cache(self, max_size=None):
+        return self.language_model.make_mtp_cache(max_size=max_size)
 
     def sanitize(self, weights):
         def _is_vision(k):

@@ -591,6 +591,54 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class TrimmableRotatingKVCache(RotatingKVCache):
+    """A bounded rotating KV cache with draft-step rollback snapshots.
+
+    RotatingKVCache overwrites confirmed slots once full, so offset-only trim is
+    insufficient for speculative writes. This cache snapshots its bounded
+    buffer before each captured update and restores the exact pre-draft state
+    on trim.
+    """
+
+    def __init__(self, max_size, keep=0):
+        super().__init__(max_size, keep)
+        self.capture_states = False
+
+    @property
+    def capture_states(self):
+        return self._capture_states
+
+    @capture_states.setter
+    def capture_states(self, value):
+        self._capture_states = bool(value)
+        if not value:
+            self._history = []
+
+    def is_trimmable(self):
+        return self.capture_states
+
+    def update_and_fetch(self, keys, values):
+        if self.capture_states:
+            snapshot_keys = mx.array(self.keys) if self.keys is not None else None
+            snapshot_values = mx.array(self.values) if self.values is not None else None
+            self._history.append(
+                (snapshot_keys, snapshot_values, self.offset, self._idx)
+            )
+        return super().update_and_fetch(keys, values)
+
+    def trim(self, amount):
+        if amount <= 0:
+            self._history = []
+            return amount
+        actual = min(amount, len(self._history))
+        if actual == 0:
+            return 0
+        keys, values, offset, idx = self._history[-actual]
+        self.keys, self.values, self.offset, self._idx = keys, values, offset, idx
+        del self._history[-actual:]
+        return actual
+
+
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)

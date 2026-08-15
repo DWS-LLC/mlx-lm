@@ -9,7 +9,12 @@ from mlx.utils import tree_flatten
 
 from mlx_lm import utils
 from mlx_lm.generate import mtp_generate_step, stream_generate
-from mlx_lm.models.cache import KVCache, TrimmableArraysCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    TrimmableArraysCache,
+    TrimmableRotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.qwen3_5 import Model, ModelArgs, MTPModule
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -230,6 +235,26 @@ class TestMTP(unittest.TestCase):
         arr[1] = mx.zeros((4, 2, 4, 4))
         self.assertIsInstance(arr.extract(0), TrimmableArraysCache)
 
+    def test_trimmable_rotating_mtp_cache_restores_overwritten_slots(self):
+        cache = TrimmableRotatingKVCache(max_size=3)
+
+        def append(value):
+            key = mx.full((1, 1, 1, 1), value)
+            cache.update_and_fetch(key, key)
+
+        append(1)
+        append(2)
+        append(3)
+        baseline = mx.array(cache.keys)
+        cache.capture_states = True
+        append(4)
+        append(5)
+        cache.trim(2)
+        mx.eval(cache.keys, baseline)
+
+        self.assertEqual(cache.offset, 3)
+        self.assertTrue(mx.array_equal(cache.keys, baseline))
+
     def test_mtp_generate_step_matches_greedy(self):
         prev_device = mx.default_device()
         mx.set_default_device(mx.cpu)
@@ -281,6 +306,7 @@ class TestMTP(unittest.TestCase):
 
             calls = []
             mtp_forward = model.mtp_forward
+            mtp_hidden = model.mtp_hidden
 
             def record_mtp_forward(hidden_states, next_token_ids, mtp_cache, **kwargs):
                 logits, fused = mtp_forward(
@@ -289,11 +315,18 @@ class TestMTP(unittest.TestCase):
                 calls.append((kwargs.get("spec_step_idx", 0), hidden_states, fused))
                 return logits, fused
 
+            def record_mtp_hidden(hidden_states, next_token_ids, mtp_cache, **kwargs):
+                fused = mtp_hidden(hidden_states, next_token_ids, mtp_cache, **kwargs)
+                calls.append((kwargs.get("spec_step_idx", 0), hidden_states, fused))
+                return fused
+
             # Force target and MTP argmaxes to agree. The first cycle accepts a
             # draft and therefore exercises reconciliation before generation
             # reaches the final direct-backbone token.
             force_token = mx.array([[1e6] + [0.0] * 31])
-            with patch.object(model, "mtp_forward", side_effect=record_mtp_forward):
+            with patch.object(
+                model, "mtp_forward", side_effect=record_mtp_forward
+            ), patch.object(model, "mtp_hidden", side_effect=record_mtp_hidden):
                 generated = list(
                     mtp_generate_step(
                         mx.array([1, 2, 3]),
@@ -309,13 +342,18 @@ class TestMTP(unittest.TestCase):
             self.assertEqual([token for token, _lp, _draft in generated], [0, 0, 0])
             self.assertTrue(any(from_draft for _token, _lp, from_draft in generated))
 
-            # The only one-token MTP calls are the reconciliation chain. Its
-            # layer-1 input must be layer 0's fused output, not a fresh
-            # backbone hidden-state slice.
-            reconcile_calls = [call for call in calls if call[1].shape[1] == 1]
-            self.assertEqual(
-                [step for step, _hidden, _fused in reconcile_calls], [0, 1]
+            # Deferred warmup adds one-token MTP calls before reconciliation.
+            # Find the layer-0 → layer-1 pair and assert recursive handoff.
+            one_token_calls = [call for call in calls if call[1].shape[1] == 1]
+            reconcile_calls = next(
+                (
+                    one_token_calls[i : i + 2]
+                    for i in range(len(one_token_calls) - 1)
+                    if [call[0] for call in one_token_calls[i : i + 2]] == [0, 1]
+                ),
+                None,
             )
+            self.assertIsNotNone(reconcile_calls)
             _, _layer0_input, layer0_fused = reconcile_calls[0]
             _, layer1_input, _layer1_fused = reconcile_calls[1]
             mx.eval(layer0_fused, layer1_input)
@@ -594,9 +632,11 @@ class TestMTP(unittest.TestCase):
                     )
                 )
 
+            # The bootstrap token was emitted and committed before deferred
+            # MTP warmup reached the failing processor.
             for entry in prompt_cache:
                 if isinstance(entry, KVCache):
-                    self.assertEqual(entry.offset, len(prompt))
+                    self.assertEqual(entry.offset, len(prompt) + 1)
         finally:
             mx.set_default_device(prev_device)
 
@@ -963,7 +1003,9 @@ class TestMTP(unittest.TestCase):
                 generator.close()
 
             self.assertEqual(token, expected)
-            self.assertEqual(histories, [1])
+            # max_tokens=1 returns before deferred MTP warmup, so no token
+            # history processor runs after the first embedding-only token.
+            self.assertEqual(histories, [])
         finally:
             mx.set_default_device(prev_device)
 

@@ -770,7 +770,8 @@ def mtp_generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
-    prefill_step_size: int = 512,
+    prefill_step_size: int = 2048,
+    mtp_cache_size: int = 8192,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
@@ -800,6 +801,8 @@ def mtp_generate_step(
         )
     if num_draft_tokens <= 0:
         raise ValueError("num_draft_tokens must be >= 1 for MTP decoding.")
+    if mtp_cache_size <= 0:
+        raise ValueError("mtp_cache_size must be positive.")
     if input_embeddings is not None:
         if not does_model_support_input_embeddings(model):
             raise ValueError("Model does not support input embeddings.")
@@ -822,7 +825,7 @@ def mtp_generate_step(
             "MTP decoding does not support populated prompt_cache entries; "
             "pass the full prompt without a stored prefix."
         )
-    mtp_cache = model.make_mtp_cache()
+    mtp_cache = model.make_mtp_cache(max_size=mtp_cache_size)
 
     def _supports_rollback(c):
         return c.is_trimmable() or isinstance(c, TrimmableArraysCache)
@@ -862,12 +865,93 @@ def mtp_generate_step(
             if isinstance(c, TrimmableArraysCache):
                 c.capture_states = on
 
-    # Prefill the backbone, collecting the pre-norm hidden for the full prompt.
-    # The chunk count is driven by the embedding length so an empty-token
-    # multimodal prompt still prefills.
+    def _snapshot_model_cache():
+        snapshots = []
+        for c in model_cache:
+            if isinstance(c, TrimmableArraysCache):
+                snapshots.append(
+                    (
+                        "trimmable",
+                        list(c.cache),
+                        list(c._history),
+                        c._state_per_t,
+                        c._conv_input,
+                        c._n_keep,
+                    )
+                )
+            elif hasattr(c, "offset"):
+                snapshots.append(("offset", c.offset))
+            else:
+                snapshots.append(("none",))
+        return snapshots
+
+    def _restore_model_cache(snapshots):
+        for c, snapshot in zip(model_cache, snapshots):
+            if snapshot[0] == "trimmable":
+                _, c.cache, c._history, c._state_per_t, c._conv_input, c._n_keep = (
+                    snapshot
+                )
+                c.cache = list(c.cache)
+                c._history = list(c._history)
+            elif snapshot[0] == "offset":
+                delta = c.offset - snapshot[1]
+                if delta > 0:
+                    c.trim(delta)
+
+    def _enable_mtp_capture(on):
+        for c in mtp_cache:
+            if hasattr(c, "capture_states"):
+                c.capture_states = on
+
+    # Retain only the bounded MTP window while prefill runs. MTP warmup is
+    # deferred until after tok0 is yielded, so first-token latency follows the
+    # backbone path rather than paying a second attention prefill up front.
     full_embeds = input_embeddings
-    hidden_chunks = []
+    mtp_prefill_step_size = min(prefill_step_size, 64)
+    warm_limit = mtp_cache_size - 1
+    warm_chunks = []
+    warm_tokens = 0
+
+    def _retain_warm_chunk(start, hidden_states):
+        nonlocal warm_tokens
+        warm_chunks.append((start, hidden_states))
+        warm_tokens += hidden_states.shape[1]
+        while warm_tokens > warm_limit:
+            old_start, old_hidden = warm_chunks[0]
+            drop = min(warm_tokens - warm_limit, old_hidden.shape[1])
+            if drop == old_hidden.shape[1]:
+                warm_chunks.pop(0)
+            else:
+                warm_chunks[0] = (old_start + drop, old_hidden[:, drop:])
+            warm_tokens -= drop
+
+    def _mtp_fused(hidden_states, next_token_ids, inputs_embeds, spec_step_idx):
+        if hasattr(model, "mtp_hidden"):
+            return model.mtp_hidden(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                spec_step_idx=spec_step_idx,
+                inputs_embeds=inputs_embeds,
+            )
+        _, fused = model.mtp_forward(
+            hidden_states,
+            next_token_ids,
+            mtp_cache,
+            spec_step_idx=spec_step_idx,
+            inputs_embeds=inputs_embeds,
+        )
+        return fused
+
+    def _prefill_mtp_chunk(hidden_states, next_token_ids, inputs_embeds):
+        fused = hidden_states
+        for j in range(len(mtp_cache)):
+            fused = _mtp_fused(fused, next_token_ids, inputs_embeds, j)
+            mx.eval(fused)
+        mx.eval([c.state for c in mtp_cache])
+
     total = len(input_embeddings) if input_embeddings is not None else y.size
+    processed = 0
     while total > 1:
         n = min(prefill_step_size, total - 1)
         emb_n = input_embeddings[:n][None] if input_embeddings is not None else None
@@ -878,19 +962,18 @@ def mtp_generate_step(
             input_embeddings=emb_n,
         )
         quantize_cache_fn(model_cache)
-        hidden_chunks.append(hid)
-        mx.eval([c.state for c in model_cache])
+        mx.eval(hid, [c.state for c in model_cache])
+        _retain_warm_chunk(processed, hid)
         y = y[n:]
         input_embeddings = (
             input_embeddings[n:] if input_embeddings is not None else None
         )
         total -= n
+        processed += n
         mx.clear_cache()
 
     unbounded = max_tokens < 0
     prev_tokens = prompt if logits_processors else None
-
-    # Bootstrap: forward over the last prompt token -> tok0 + its hidden.
     emb_last = input_embeddings[-1:][None] if input_embeddings is not None else None
     logits, hid_last = model(
         y[None],
@@ -900,55 +983,94 @@ def mtp_generate_step(
     )
     quantize_cache_fn(model_cache)
     mx.eval(logits, hid_last)
-    tok0, logprobs0 = _process_and_sample(prev_tokens, logits[0, -1])
-    tok0 = tok0.item()
+    first_tok, first_logprobs = _process_and_sample(prev_tokens, logits[0, -1])
+    first_tok = first_tok.item()
+    if not unbounded and max_tokens == 0:
+        return
 
-    # Prefill the MTP attention cache with the shifted prompt sequence: the
-    # MTP head predicts token t+2 from (hidden_t, token_{t+1}), so position t
-    # consumes the next token and the backbone hidden at t. The prefill's last
-    # logits are the first draft prediction, so no extra forward is needed.
-    full_hidden = mx.concatenate(hidden_chunks + [hid_last], axis=1)
+    # Yield the first target token immediately. The narrow try/finally commits
+    # it only when the generator resumes or closes, so TTFT does not include a
+    # second target decode while reusable prompt caches remain honest.
+    try:
+        yield first_tok, first_logprobs, False
+    finally:
+        first_cache_snapshot = _snapshot_model_cache()
+        _enable_capture(True)
+        try:
+            first_logits, hid_first = model(
+                mx.array([[first_tok]], mx.uint32),
+                cache=model_cache,
+                return_hidden=True,
+            )
+            quantize_cache_fn(model_cache)
+            mx.eval(first_logits, hid_first, [c.state for c in model_cache])
+        except Exception:
+            _restore_model_cache(first_cache_snapshot)
+            raise
+        finally:
+            _enable_capture(False)
+    ntoks = 1
+    prev_tokens = _append_token(prev_tokens, first_tok)
+    if not unbounded and ntoks >= max_tokens:
+        return
+
+    # Warm the bounded MTP cache after first yield. Historical chunks are
+    # already aligned with their prompt[t + 1] inputs; the final prompt state
+    # consumes first_tok, then hid_first / next_tok seed speculation.
+    for chunk_start, chunk_hidden in warm_chunks:
+        for start in range(0, chunk_hidden.shape[1], mtp_prefill_step_size):
+            end = min(start + mtp_prefill_step_size, chunk_hidden.shape[1])
+            if full_embeds is not None:
+                shifted_embeds = full_embeds[
+                    chunk_start + start + 1 : chunk_start + end + 1
+                ][None]
+                _prefill_mtp_chunk(chunk_hidden[:, start:end], None, shifted_embeds)
+            else:
+                shifted_tokens = prompt[
+                    chunk_start + start + 1 : chunk_start + end + 1
+                ][None]
+                _prefill_mtp_chunk(chunk_hidden[:, start:end], shifted_tokens, None)
+
     if full_embeds is not None:
-        tok_emb = model.model.embed_tokens(mx.array([tok0], mx.uint32))
-        shifted_embeds = mx.concatenate([full_embeds[1:], tok_emb], axis=0)
-        next_tokens = None
-        inputs_embeds = shifted_embeds[None]
+        first_inputs_embeds = model.model.embed_tokens(
+            mx.array([first_tok], mx.uint32)
+        )[None]
+        first_next_tokens = None
     else:
-        shifted = mx.concatenate([prompt[1:], mx.array([tok0], mx.uint32)], axis=0)
-        next_tokens = shifted[None]
-        inputs_embeds = None
+        first_inputs_embeds = None
+        first_next_tokens = mx.array([[first_tok]], mx.uint32)
+    _, prompt_fused = model.mtp_forward(
+        hid_last,
+        first_next_tokens,
+        mtp_cache,
+        inputs_embeds=first_inputs_embeds,
+    )
+    mx.eval(prompt_fused)
+    fused = prompt_fused
+    for j in range(1, len(mtp_cache)):
+        fused = _mtp_fused(fused, first_next_tokens, first_inputs_embeds, j)
+        mx.eval(fused)
 
-    # Prefill every MTP layer recursively: layer 0 consumes the backbone
-    # hidden, each subsequent layer consumes the preceding layer's fused
-    # output, so every depth's causal cache and RoPE offset is warmed with the
-    # prompt context.
-    hidden = full_hidden
-    l_seed = None
-    h_seed = None
-    for j in range(len(mtp_cache)):
-        l, h = model.mtp_forward(
-            hidden,
-            next_tokens,
-            mtp_cache,
-            spec_step_idx=j,
-            inputs_embeds=inputs_embeds,
-        )
-        mx.eval(l, h)
-        if j == 0:
-            l_seed = l
-            h_seed = h
-        hidden = h
-    mx.eval([c.state for c in mtp_cache])
+    next_tok, logprobs0 = _process_and_sample(prev_tokens, first_logits[0, -1])
+    tok0 = next_tok.item()
+    l_seed, h_seed = model.mtp_forward(
+        hid_first,
+        mx.array([[tok0]], mx.uint32),
+        mtp_cache,
+    )
+    mx.eval(l_seed, h_seed, [c.state for c in mtp_cache])
     seed_tokens = _append_token(prev_tokens, tok0)
     d1 = _process_and_sample(seed_tokens, l_seed[0, -1])[0].item()
     h = h_seed[:, -1:]
-    ntoks = 0
     num_draft = 0
     n_accept = 0
     # Verification appends tok0 plus every draft to model_cache. Count the
     # entries not yet yielded so exceptions and early generator closure can
     # restore a caller-owned cache to the emitted prefix.
     pending_trim = 0
+    verify_cache_snapshot = None
+    verify_in_progress = False
+    verify_emitted = False
     try:
         while unbounded or ntoks < max_tokens:
             if unbounded:
@@ -978,6 +1100,7 @@ def mtp_generate_step(
             h_cur = h
             draft_tokens = seed_tokens
             appended = [0] * len(mtp_cache)
+            _enable_mtp_capture(True)
             for k in range(max(0, num_draft - 1)):
                 l_mtp, h_cur = model.mtp_forward(
                     h_cur,
@@ -992,6 +1115,9 @@ def mtp_generate_step(
                 draft.append(tok_cur)
 
             # Batched verify with capture enabled for O(1) backbone rollback.
+            verify_cache_snapshot = _snapshot_model_cache()
+            verify_in_progress = True
+            verify_emitted = False
             _enable_capture(True)
             v_logits, v_hidden = model(
                 mx.array([draft], mx.uint32), cache=model_cache, return_hidden=True
@@ -1015,6 +1141,7 @@ def mtp_generate_step(
             while n_accept < num_draft and draft[n_accept + 1] == v_toks[n_accept]:
                 n_accept += 1
             pending_trim -= 1
+            verify_emitted = True
             yield tok0, logprobs0, False
             ntoks += 1
             prev_tokens = _append_token(prev_tokens, tok0)
@@ -1034,9 +1161,10 @@ def mtp_generate_step(
             # The next cycle's seed history includes the just-confirmed token.
             seed_tokens = _append_token(prev_tokens, tok0)
 
-            # Rewind the backbone to the confirmed prefix and stop capturing.
             cache.trim_prompt_cache(model_cache, pending_trim)
             pending_trim = 0
+            verify_cache_snapshot = None
+            verify_in_progress = False
             _enable_capture(False)
 
             # Reconcile the MTP cache: drop each layer's draft-appended slots
@@ -1047,6 +1175,7 @@ def mtp_generate_step(
             for j, cnt in enumerate(appended):
                 if cnt:
                     mtp_cache[j].trim(cnt)
+            _enable_mtp_capture(False)
             confirm_tokens = draft[1 : n_accept + 1] + [v_toks[n_accept]]
             confirm_hidden = v_hidden[:, : n_accept + 1]
             for j, confirm_token in enumerate(confirm_tokens):
@@ -1062,9 +1191,16 @@ def mtp_generate_step(
             d1 = _process_and_sample(seed_tokens, l_next[0, -1])[0].item()
             h = reconcile_hidden
     finally:
-        if pending_trim:
+        if (
+            verify_in_progress
+            and not verify_emitted
+            and verify_cache_snapshot is not None
+        ):
+            _restore_model_cache(verify_cache_snapshot)
+        elif pending_trim:
             cache.trim_prompt_cache(model_cache, pending_trim)
         _enable_capture(False)
+        _enable_mtp_capture(False)
 
 
 def stream_generate(
