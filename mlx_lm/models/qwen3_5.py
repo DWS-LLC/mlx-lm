@@ -417,6 +417,11 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        # Pipeline loading discovers local shard files from the model parameter
+        # tree before it downloads weights. Config-declared MTP layers must be
+        # present at that point or their mtp.* shards are omitted.
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPModule(args)
 
     def __call__(
         self,
@@ -502,10 +507,12 @@ class TextModel(nn.Module):
         )
         should_shift_mtp = is_raw_mtp and has_mtp_weights
 
-        # Build the MTP head only when the checkpoint actually ships its
-        # weights. A config advertising mtp_num_hidden_layers > 0 with no mtp.*
-        # weights still loads as a plain trunk. When the config omits the count,
-        # infer it from the mtp.layers.<i> weight keys.
+        # Config-declared MTP layers are constructed in __init__ so pipeline
+        # shard discovery includes their parameters before weights download.
+        # Retain that head for an empty lazy-load weight map; after an actual
+        # non-empty checkpoint lacks mtp.* tensors, remove it and load a plain
+        # trunk instead. When the config omits the count, infer it from the
+        # mtp.layers.<i> weight keys.
         if has_mtp_weights:
             if self.args.mtp_num_hidden_layers <= 0:
                 indices = set()
@@ -515,13 +522,14 @@ class TextModel(nn.Module):
                         indices.add(int(m.group(1)))
                 if indices:
                     self.args.mtp_num_hidden_layers = max(indices) + 1
-            if self.args.mtp_num_hidden_layers > 0:
-                if not hasattr(self, "mtp"):
-                    self.mtp = MTPModule(self.args)
-            else:
+            if self.args.mtp_num_hidden_layers > 0 and not hasattr(self, "mtp"):
+                self.mtp = MTPModule(self.args)
+            elif self.args.mtp_num_hidden_layers <= 0:
                 weights = {k: v for k, v in weights.items() if "mtp." not in k}
         else:
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
+            if weights and hasattr(self, "mtp"):
+                delattr(self, "mtp")
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)

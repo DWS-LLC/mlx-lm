@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.generate import mtp_generate_step, stream_generate
 from mlx_lm.models.cache import KVCache, TrimmableArraysCache, make_prompt_cache
@@ -74,6 +75,19 @@ class TestMTP(unittest.TestCase):
         model = _make_model(mtp_num_hidden_layers=1)
         model.sanitize(_mtp_weights())
         self.assertTrue(hasattr(model.language_model, "mtp"))
+
+    def test_config_declared_mtp_parameters_survive_empty_sanitize(self):
+        model = _make_model(mtp_num_hidden_layers=2)
+        # pipeline_load performs this config-only sanitize before collecting
+        # tree_flatten(model.parameters()) to choose safetensor shards.
+        model.sanitize({})
+
+        self.assertTrue(hasattr(model.language_model, "mtp"))
+        keys = {key for key, _ in tree_flatten(model.parameters())}
+        self.assertTrue(any(key.startswith("language_model.mtp.") for key in keys))
+        self.assertTrue(
+            any(key.startswith("language_model.mtp.layers.1.") for key in keys)
+        )
 
     def test_sanitize_no_double_shift_on_converted(self):
         base = mx.arange(8, dtype=mx.float32)
